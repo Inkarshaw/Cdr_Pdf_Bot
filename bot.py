@@ -177,6 +177,10 @@ async def to_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["relation"] = update.message.text.strip()
+    # Ensure address fields exist even for conversations started before a redeploy.
+    context.user_data.setdefault("station", STATION)
+    context.user_data.setdefault("from_address", FROM_ADDRESS)
+    context.user_data.setdefault("to_address", TO_ADDRESS)
     pdf = build_pdf(context.user_data)
     name = f"CDR_Request_{context.user_data['number']}.pdf"
     await update.message.reply_document(document=pdf, filename=name,
