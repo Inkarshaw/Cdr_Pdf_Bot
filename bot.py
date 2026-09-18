@@ -24,6 +24,21 @@ STATION = "G7 Chetpet PS (L&O)"
 FROM_ADDRESS = "Inspector of Police,<br/>G7 Chetpet PS (L&O),<br/>Chetpet, Chennai - 31."
 TO_ADDRESS = "The Deputy Commissioner of Police,<br/>Kilpauk District,<br/>Chennai - 600010."
 
+STATIONS = {
+    "G7 Chetpet PS (L&O)": (
+        "Inspector of Police,<br/>G7 Chetpet PS (L&O),<br/>Chetpet, Chennai - 31.",
+        "The Deputy Commissioner of Police,<br/>Kilpauk District,<br/>Chennai - 600010."
+    ),
+    "G5 Secretariat Colony PS": (
+        "Inspector of Police,<br/>G5 Secretariat Colony PS,<br/>Chennai.",
+        "The Deputy Commissioner of Police,<br/>Kilpauk District,<br/>Chennai - 600010."
+    ),
+    "G3 Kilpauk PS (L&O)": (
+        "Inspector of Police,<br/>G3 Kilpauk PS (L&O),<br/>Chennai.",
+        "The Deputy Commissioner of Police,<br/>Kilpauk District,<br/>Chennai - 600010."
+    ),
+}
+
 def identifier(text):
     v = re.sub(r"\s+", "", text or "")
     if re.fullmatch(r"\d{10}", v):
@@ -100,10 +115,12 @@ def build_pdf(d):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    keyboard = [["G7 Chetpet PS (L&O)"], ["G5 Secretariat Colony PS"], ["G3 Kilpauk PS (L&O)"], ["Other Police Station"]]
     await update.message.reply_text(
-        "CDR PDF generator ready.\n\nSend a 10-digit mobile number or 15-digit IMEI.\nUse /cancel anytime."
+        "Select Police Station:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     )
-    return ConversationHandler.END
+    return STATION_STEP
 
 async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kind, value = identifier(update.message.text)
@@ -116,7 +133,19 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CRIME
 
 async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    station = update.message.text.strip()
+    text = update.message.text.strip()
+
+    # Once a station is selected, the next message is the mobile number / IMEI.
+    if context.user_data.get("station") and not context.user_data.get("awaiting_custom_station"):
+        kind, value = identifier(text)
+        if not kind:
+            await update.message.reply_text("Send a valid 10-digit mobile number or 15-digit IMEI.")
+            return STATION_STEP
+        context.user_data.update(kind=kind, number=value)
+        await update.message.reply_text("Enter Crime Number with year (example: 43/2026):")
+        return CRIME
+
+    station = text
     if station in STATIONS:
         from_address, to_address = STATIONS[station]
     elif station == "Other Police Station":
@@ -136,8 +165,11 @@ async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please select a station from the buttons.")
         return STATION_STEP
     context.user_data.update(station=station, from_address=from_address, to_address=to_address)
-    await update.message.reply_text("Enter Crime Number with year (example: 43/2026):", reply_markup=ReplyKeyboardRemove())
-    return CRIME
+    await update.message.reply_text(
+        "Send a 10-digit mobile number or 15-digit IMEI:",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return STATION_STEP
 
 async def crime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     v = update.message.text.strip()
@@ -198,8 +230,9 @@ def main():
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set.")
     app = Application.builder().token(TOKEN).build()
     conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, begin)],
+        entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, begin)],
         states={
+            STATION_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, station_step)],
             CRIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, crime)],
             SECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, section)],
             FROM_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, from_date)],
@@ -208,9 +241,8 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(conv)
+    app.add_handler(CommandHandler("cancel", cancel))
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
