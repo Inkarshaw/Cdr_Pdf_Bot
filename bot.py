@@ -111,7 +111,7 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Send a valid 10-digit mobile number or 15-digit IMEI.")
         return ConversationHandler.END
     context.user_data.clear()
-    context.user_data.update(kind=kind, number=value)
+    context.user_data.update(kind=kind, number=value, station=STATION, from_address=FROM_ADDRESS, to_address=TO_ADDRESS)
     await update.message.reply_text("Enter Crime Number with year (example: 43/2026):")
     return CRIME
 
