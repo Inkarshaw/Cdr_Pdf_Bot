@@ -246,9 +246,18 @@ async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=pdf,
             filename=name,
-            caption="PDF generated. This tool only prepares the document; it does not obtain or submit telecom records."
+            caption="PDF generated. To add another number to this same request, send /add."
         )
+        saved = {
+            "station": context.user_data.get("station", STATION),
+            "from_address": context.user_data.get("from_address", FROM_ADDRESS),
+            "to_address": context.user_data.get("to_address", TO_ADDRESS),
+            "crime": context.user_data["crime"],
+            "section": context.user_data["section"],
+            "items": list(context.user_data.get("items", [])),
+        }
         context.user_data.clear()
+        context.user_data["last_request"] = saved
         return ConversationHandler.END
 
     kind, value = identifier(update.message.text)
@@ -263,6 +272,18 @@ async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Type YES to add another number, or NO to generate the PDF.")
     return ADD_MORE
 
+async def add_after_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    saved = context.user_data.get("last_request")
+    if not saved:
+        await update.message.reply_text("No previous PDF request is available. Send /start to create a new request.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data.update(saved)
+    await update.message.reply_text(
+        f"Adding to Cr.No. {saved['crime']} U/s {saved['section']}.\n\nSend the next 10-digit mobile number or 15-digit IMEI:"
+    )
+    return ADD_MORE
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelled. Send a mobile number or IMEI to start again.")
@@ -273,7 +294,7 @@ def main():
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set.")
     app = Application.builder().token(TOKEN).build()
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, begin)],
+        entry_points=[CommandHandler("start", start), CommandHandler("add", add_after_pdf), MessageHandler(filters.TEXT & ~filters.COMMAND, begin)],
         states={
             STATION_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, station_step)],
             CRIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, crime)],
