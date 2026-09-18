@@ -18,7 +18,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-STATION_STEP, CRIME, SECTION, FROM_DATE, TO_DATE, RELATION = range(6)
+STATION_STEP, CRIME, SECTION, FROM_DATE, TO_DATE, RELATION, ADD_MORE = range(7)
 
 STATION = "G7 Chetpet PS (L&O)"
 FROM_ADDRESS = "Inspector of Police,<br/>G7 Chetpet PS (L&O),<br/>Chetpet, Chennai - 31."
@@ -83,10 +83,17 @@ def build_pdf(d):
         normal))
     story.append(Spacer(1, 3*mm))
 
-    data = [
-        ["S.No.", "Mobile/IMEI Number", "From", "To", "Whose/How related"],
-        ["1", d["number"], d["from_date"], d["to_date"], d["relation"]],
-    ]
+    items = d.get("items") or [{
+        "number": d["number"],
+        "from_date": d["from_date"],
+        "to_date": d["to_date"],
+        "relation": d["relation"],
+    }]
+    data = [["S.No.", "Mobile/IMEI Number", "From", "To", "Whose/How related"]]
+    for i, item in enumerate(items, 1):
+        data.append([
+            str(i), item["number"], item["from_date"], item["to_date"], item["relation"]
+        ])
     widths = [13*mm, 53*mm, 24*mm, 24*mm, 45*mm]
     table = Table(data, colWidths=widths, repeatRows=1)
     table.setStyle(TableStyle([
@@ -211,16 +218,50 @@ async def to_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["relation"] = update.message.text.strip()
-    # Ensure address fields exist even for conversations started before a redeploy.
-    context.user_data.setdefault("station", STATION)
-    context.user_data.setdefault("from_address", FROM_ADDRESS)
-    context.user_data.setdefault("to_address", TO_ADDRESS)
-    pdf = build_pdf(context.user_data)
-    name = f"CDR_Request_{context.user_data['number']}.pdf"
-    await update.message.reply_document(document=pdf, filename=name,
-        caption="PDF generated. This tool only prepares the document; it does not obtain or submit telecom records.")
-    context.user_data.clear()
-    return ConversationHandler.END
+    item = {
+        "number": context.user_data["number"],
+        "from_date": context.user_data["from_date"],
+        "to_date": context.user_data["to_date"],
+        "relation": context.user_data["relation"],
+    }
+    context.user_data.setdefault("items", []).append(item)
+    await update.message.reply_text(
+        f"Added {context.user_data['number']}.\n\nAdd another mobile/IMEI with the same Crime No., Section and Police Station? Type YES or NO."
+    )
+    return ADD_MORE
+
+async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.message.text.strip().upper()
+    if answer in ("YES", "Y"):
+        await update.message.reply_text(
+            "Send the next 10-digit mobile number or 15-digit IMEI:"
+        )
+        return ADD_MORE
+    if answer in ("NO", "N", "DONE"):
+        context.user_data.setdefault("station", STATION)
+        context.user_data.setdefault("from_address", FROM_ADDRESS)
+        context.user_data.setdefault("to_address", TO_ADDRESS)
+        pdf = build_pdf(context.user_data)
+        name = f"CDR_Request_{context.user_data['crime'].replace('/', '_')}.pdf"
+        await update.message.reply_document(
+            document=pdf,
+            filename=name,
+            caption="PDF generated. This tool only prepares the document; it does not obtain or submit telecom records."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    kind, value = identifier(update.message.text)
+    if kind:
+        context.user_data.update(kind=kind, number=value)
+        await update.message.reply_text(
+            "Enter From Date for this number (DD/MM/YYYY):"
+        )
+        context.user_data["adding_number"] = True
+        return FROM_DATE
+
+    await update.message.reply_text("Type YES to add another number, or NO to generate the PDF.")
+    return ADD_MORE
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -240,6 +281,7 @@ def main():
             FROM_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, from_date)],
             TO_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, to_date)],
             RELATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, relation)],
+            ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_more)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
