@@ -4,7 +4,7 @@ import logging
 from io import BytesIO
 from datetime import datetime
 
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, ConversationHandler, filters
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -16,7 +16,7 @@ from reportlab.lib.enums import TA_RIGHT
 logging.basicConfig(level=logging.WARNING)\nlogging.getLogger("httpx").setLevel(logging.WARNING)\nlogging.getLogger("telegram").setLevel(logging.WARNING)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-CRIME, SECTION, FROM_DATE, TO_DATE, RELATION = range(5)
+STATION_STEP, CRIME, SECTION, FROM_DATE, TO_DATE, RELATION = range(6)
 
 STATION = "G7 Chetpet PS (L&O)"
 FROM_ADDRESS = "Inspector of Police,<br/>G7 Chetpet PS (L&O),<br/>Chetpet, Chennai - 31."
@@ -51,10 +51,10 @@ def build_pdf(d):
     story.append(Paragraph("Date: " + datetime.now().strftime("%d/%m/%Y"), right))
     story.append(Spacer(1, 5*mm))
     story.append(Paragraph("From", normal))
-    story.append(Paragraph(FROM_ADDRESS, ParagraphStyle("indent", parent=normal, leftIndent=10*mm)))
+    story.append(Paragraph(d["from_address"], ParagraphStyle("indent", parent=normal, leftIndent=10*mm)))
     story.append(Spacer(1, 4*mm))
     story.append(Paragraph("To", normal))
-    story.append(Paragraph(TO_ADDRESS, ParagraphStyle("indent2", parent=normal, leftIndent=10*mm)))
+    story.append(Paragraph(d["to_address"], ParagraphStyle("indent2", parent=normal, leftIndent=10*mm)))
     story.append(Spacer(1, 5*mm))
     story.append(Paragraph("Respected Sir,", normal))
     story.append(Spacer(1, 2*mm))
@@ -111,6 +111,30 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data.update(kind=kind, number=value)
     await update.message.reply_text("Enter Crime Number with year (example: 43/2026):")
+    return CRIME
+
+async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    station = update.message.text.strip()
+    if station in STATIONS:
+        from_address, to_address = STATIONS[station]
+    elif station == "Other Police Station":
+        await update.message.reply_text("Type the station name and full From address separated by |\nExample: X1 Example PS | Inspector of Police, X1 Example PS, Chennai")
+        context.user_data["awaiting_custom_station"] = True
+        return STATION_STEP
+    elif context.user_data.get("awaiting_custom_station"):
+        if "|" not in station:
+            await update.message.reply_text("Use: Station Name | Full From address")
+            return STATION_STEP
+        name, addr = [x.strip() for x in station.split("|", 1)]
+        station = name
+        from_address = addr.replace(",", ",<br/>")
+        to_address = "The Deputy Commissioner of Police,<br/>Kilpauk District,<br/>Chennai - 600010."
+        context.user_data.pop("awaiting_custom_station", None)
+    else:
+        await update.message.reply_text("Please select a station from the buttons.")
+        return STATION_STEP
+    context.user_data.update(station=station, from_address=from_address, to_address=to_address)
+    await update.message.reply_text("Enter Crime Number with year (example: 43/2026):", reply_markup=ReplyKeyboardRemove())
     return CRIME
 
 async def crime(update: Update, context: ContextTypes.DEFAULT_TYPE):
