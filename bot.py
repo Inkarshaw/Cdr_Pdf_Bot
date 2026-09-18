@@ -13,7 +13,9 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT
 
-logging.basicConfig(level=logging.WARNING)\nlogging.getLogger("httpx").setLevel(logging.WARNING)\nlogging.getLogger("telegram").setLevel(logging.WARNING)
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 STATION_STEP, CRIME, SECTION, FROM_DATE, TO_DATE, RELATION = range(6)
