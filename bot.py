@@ -115,10 +115,9 @@ def build_pdf(d):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    keyboard = [["G7 Chetpet PS (L&O)"], ["G5 Secretariat Colony PS"], ["G3 Kilpauk PS (L&O)"], ["Other Police Station"]]
     await update.message.reply_text(
-        "Select Police Station:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        "Enter Police Station code (example: G7):",
+        reply_markup=ReplyKeyboardRemove()
     )
     return STATION_STEP
 
@@ -135,8 +134,8 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # Once a station is selected, the next message is the mobile number / IMEI.
-    if context.user_data.get("station") and not context.user_data.get("awaiting_custom_station"):
+    # After station is resolved, accept the mobile number / IMEI.
+    if context.user_data.get("station"):
         kind, value = identifier(text)
         if not kind:
             await update.message.reply_text("Send a valid 10-digit mobile number or 15-digit IMEI.")
@@ -145,28 +144,31 @@ async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Enter Crime Number with year (example: 43/2026):")
         return CRIME
 
-    station = text
-    if station in STATIONS:
-        from_address, to_address = STATIONS[station]
-    elif station == "Other Police Station":
-        await update.message.reply_text("Type the station name and full From address separated by |\nExample: X1 Example PS | Inspector of Police, X1 Example PS, Chennai")
-        context.user_data["awaiting_custom_station"] = True
+    code = re.sub(r"[^A-Z0-9]", "", text.upper())
+    aliases = {
+        "G7": "G7 Chetpet PS (L&O)",
+        "G7CHETPET": "G7 Chetpet PS (L&O)",
+        "G7CHETPETPS": "G7 Chetpet PS (L&O)",
+        "G5": "G5 Secretariat Colony PS",
+        "G5SECRETARIATCOLONY": "G5 Secretariat Colony PS",
+        "G5SECRETARIATCOLONYPS": "G5 Secretariat Colony PS",
+        "G3": "G3 Kilpauk PS (L&O)",
+        "G3KILPAUK": "G3 Kilpauk PS (L&O)",
+        "G3KILPAUKPS": "G3 Kilpauk PS (L&O)",
+    }
+    station = aliases.get(code)
+    if not station:
+        await update.message.reply_text("Station not recognised. Type G7, G5, or G3.")
         return STATION_STEP
-    elif context.user_data.get("awaiting_custom_station"):
-        if "|" not in station:
-            await update.message.reply_text("Use: Station Name | Full From address")
-            return STATION_STEP
-        name, addr = [x.strip() for x in station.split("|", 1)]
-        station = name
-        from_address = addr.replace(",", ",<br/>")
-        to_address = "The Deputy Commissioner of Police,<br/>Kilpauk District,<br/>Chennai - 600010."
-        context.user_data.pop("awaiting_custom_station", None)
-    else:
-        await update.message.reply_text("Please select a station from the buttons.")
-        return STATION_STEP
-    context.user_data.update(station=station, from_address=from_address, to_address=to_address)
+
+    from_address, to_address = STATIONS[station]
+    context.user_data.update(
+        station=station,
+        from_address=from_address,
+        to_address=to_address
+    )
     await update.message.reply_text(
-        "Send a 10-digit mobile number or 15-digit IMEI:",
+        f"Selected: {station}\n\nSend a 10-digit mobile number or 15-digit IMEI:",
         reply_markup=ReplyKeyboardRemove()
     )
     return STATION_STEP
