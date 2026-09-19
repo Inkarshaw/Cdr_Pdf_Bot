@@ -18,7 +18,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-STATION_STEP, CRIME, SECTION, FROM_DATE, TO_DATE, RELATION, ADD_MORE = range(7)
+STATION_STEP, CRIME, SECTION, FROM_DATE, TO_DATE, RELATION, ADD_MORE, CHANGE_NUMBER = range(8)
 
 STATION = "G7 Chetpet PS (L&O)"
 FROM_ADDRESS = "Inspector of Police,<br/>G7 Chetpet PS (L&O),<br/>Chetpet, Chennai - 31."
@@ -329,6 +329,60 @@ async def add_after_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return RELATION
 
+async def change_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    saved = context.user_data.get("last_request")
+    if not saved or not saved.get("items"):
+        await update.message.reply_text("No previous PDF request is available. Send /start to create one.")
+        return ConversationHandler.END
+
+    rows = []
+    for i, item in enumerate(saved["items"], 1):
+        rows.append(f"{i}. {item['number']} - {item.get('relation', '-')}")
+    await update.message.reply_text(
+        "Which number do you want to change?\n\n" +
+        "\n".join(rows) +
+        "\n\nSend: row number + new mobile/IMEI\nExample: 2 9876543210"
+    )
+    return CHANGE_NUMBER
+
+async def change_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    saved = context.user_data.get("last_request")
+    text = update.message.text.strip()
+    m = re.fullmatch(r"(\\d+)\\s+(\\d{10}|\\d{15})", text)
+    if not m:
+        await update.message.reply_text("Use: row number + new mobile/IMEI\nExample: 2 9876543210")
+        return CHANGE_NUMBER
+
+    row = int(m.group(1))
+    new_number = m.group(2)
+    if row < 1 or row > len(saved["items"]):
+        await update.message.reply_text(f"Choose a row from 1 to {len(saved['items'])}.")
+        return CHANGE_NUMBER
+
+    kind, value = identifier(new_number)
+    if not kind:
+        await update.message.reply_text("Enter a valid 10-digit mobile number or 15-digit IMEI.")
+        return CHANGE_NUMBER
+
+    old_number = saved["items"][row - 1]["number"]
+    saved["items"][row - 1]["number"] = value
+    context.user_data["last_request"] = saved
+
+    pdf_data = dict(saved)
+    pdf_data["number"] = saved["items"][0]["number"]
+    pdf_data["relation"] = saved["items"][0].get("relation", "-")
+    pdf_data["from_date"] = saved.get("from_date", saved["items"][0]["from_date"])
+    pdf_data["to_date"] = saved.get("to_date", saved["items"][0]["to_date"])
+
+    pdf = build_pdf(pdf_data)
+    name = f"CDR_Request_{saved['crime'].replace('/', '_')}.pdf"
+    await update.message.reply_document(
+        document=pdf,
+        filename=name,
+        caption=f"Changed {old_number} to {value}. Updated PDF generated."
+    )
+    return ConversationHandler.END
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelled. Send a mobile number or IMEI to start again.")
@@ -339,7 +393,7 @@ def main():
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set.")
     app = Application.builder().token(TOKEN).build()
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start), CommandHandler("add", add_after_pdf), MessageHandler(filters.TEXT & ~filters.COMMAND, begin)],
+        entry_points=[CommandHandler("start", start), CommandHandler("add", add_after_pdf), CommandHandler("change", change_number), MessageHandler(filters.TEXT & ~filters.COMMAND, begin)],
         states={
             STATION_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, station_step)],
             CRIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, crime)],
@@ -347,7 +401,7 @@ def main():
             FROM_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, from_date)],
             TO_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, to_date)],
             RELATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, relation)],
-            ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_more)],
+            ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_more)],\n            CHANGE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_number_step)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
