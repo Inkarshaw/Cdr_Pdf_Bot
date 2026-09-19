@@ -348,7 +348,7 @@ async def change_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def change_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saved = context.user_data.get("last_request")
     text = update.message.text.strip()
-    m = re.fullmatch(r"(\\d+)\\s+(\\d{10}|\\d{15})", text)
+    m = re.fullmatch(r"(\d+)\s+(\d{10}|\d{15})", text)
     if not m:
         await update.message.reply_text("Use: row number + new mobile/IMEI\nExample: 2 9876543210")
         return CHANGE_NUMBER
@@ -400,7 +400,7 @@ async def remove_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def remove_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saved = context.user_data.get("last_request")
     text = update.message.text.strip()
-    if not re.fullmatch(r"\\d+", text):
+    if not re.fullmatch(r"\d+", text):
         await update.message.reply_text("Send the row number only. Example: 2")
         return REMOVE_NUMBER
 
