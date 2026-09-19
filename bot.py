@@ -219,7 +219,7 @@ async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     invalid = []
 
     for line in lines:
-        m = re.match(r"^(\\d{10}|\\d{15})(?:\\s*[|,\\-]\\s*|\\s+)?(.*)$", line)
+        m = re.match(r"^(\d{10}|\d{15})(?:\s*[|,\-]\s*|\s+)?(.*)$", line)
         if not m:
             invalid.append(line)
             continue
