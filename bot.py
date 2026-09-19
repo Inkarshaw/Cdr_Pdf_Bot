@@ -517,14 +517,14 @@ async def bank_request_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ("account", "a", "bank account", "account number"):
         context.user_data["request_type"] = "account"
         await update.message.reply_text(
-            "Send all account number(s) in ONE message.\\n"
+            "Send all account number(s) in ONE message.\n"
             "Use spaces, commas, or new lines between numbers."
         )
         return BANK_IDENTIFIERS
     if text in ("mobile", "m", "phone", "phone number"):
         context.user_data["request_type"] = "mobile"
         await update.message.reply_text(
-            "Send all 10-digit mobile number(s) in ONE message.\\n"
+            "Send all 10-digit mobile number(s) in ONE message.\n"
             "Use spaces, commas, or new lines between numbers."
         )
         return BANK_IDENTIFIERS
@@ -533,19 +533,19 @@ async def bank_request_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return BANK_REQUEST_TYPE
 
 def _parse_bank_identifiers(text, request_type):
-    tokens = [x for x in re.split(r"[\\s,;]+", (text or "").strip()) if x]
+    tokens = [x for x in re.split(r"[\s,;]+", (text or "").strip()) if x]
     if not tokens:
         return [], []
     valid = []
     invalid = []
     for token in tokens:
         if request_type == "mobile":
-            if re.fullmatch(r"\\d{10}", token):
+            if re.fullmatch(r"\d{10}", token):
                 valid.append(token)
             else:
                 invalid.append(token)
         else:
-            if re.fullmatch(r"\\d{6,30}", token):
+            if re.fullmatch(r"\d{6,30}", token):
                 valid.append(token)
             else:
                 invalid.append(token)
@@ -557,7 +557,7 @@ async def bank_identifiers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if invalid or not valid:
         label = "10-digit mobile numbers" if request_type == "mobile" else "numeric account numbers"
         msg = "Invalid value(s): " + ", ".join(invalid or [update.message.text.strip()])
-        msg += f"\\n\\nSend only {label}, separated by spaces, commas, or new lines."
+        msg += f"\n\nSend only {label}, separated by spaces, commas, or new lines."
         await update.message.reply_text(msg)
         return BANK_IDENTIFIERS
 
@@ -613,7 +613,7 @@ async def bank_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         email = text
 
-    if not re.fullmatch(r"[^\\s@]+@[^\\s@]+\\.[^\\s@]+", email):
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
         await update.message.reply_text("Enter a valid email address.")
         return BANK_EMAIL
 
