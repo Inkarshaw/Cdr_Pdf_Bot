@@ -1,8 +1,19 @@
 import os
 import re
+import json
+import hmac
+import base64
+import hashlib
 import logging
+import threading
+import uuid
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, ConversationHandler, filters
@@ -430,6 +441,249 @@ async def remove_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     return ConversationHandler.END
 
+
+# ---------------------------------------------------------------------------
+# My Cases secure Google Sheets API
+# ---------------------------------------------------------------------------
+MYCASES_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+MYCASES_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Cases")
+MYCASES_PASSWORD = os.environ.get("MYCASES_PASSWORD", "")
+MYCASES_SESSION_SECRET = os.environ.get("SESSION_SECRET", "")
+MYCASES_TOKEN_HOURS = 12
+
+MYCASES_FIELDS = [
+    "id", "policeStation", "caseType", "crimeNo", "crimeYear",
+    "sections", "complainant", "accused", "ioName", "priority",
+    "court", "courtCaseNo", "stage", "nextHearing", "nextAction",
+    "notes", "createdAt", "updatedAt"
+]
+
+api_app = Flask("clearexams_mycases_api")
+CORS(
+    api_app,
+    origins=["https://clearexams.ink", "https://www.clearexams.ink"],
+    supports_credentials=False,
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+)
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+def _b64url_decode(text: str) -> bytes:
+    padding = "=" * ((4 - len(text) % 4) % 4)
+    return base64.urlsafe_b64decode(text + padding)
+
+def _issue_token() -> str:
+    if not MYCASES_SESSION_SECRET:
+        raise RuntimeError("SESSION_SECRET is not configured")
+    payload = {
+        "exp": int((datetime.now(timezone.utc) + timedelta(hours=MYCASES_TOKEN_HOURS)).timestamp()),
+        "nonce": uuid.uuid4().hex,
+    }
+    body = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    sig = _b64url(hmac.new(
+        MYCASES_SESSION_SECRET.encode("utf-8"),
+        body.encode("ascii"),
+        hashlib.sha256
+    ).digest())
+    return f"{body}.{sig}"
+
+def _valid_token(token: str) -> bool:
+    if not token or not MYCASES_SESSION_SECRET or "." not in token:
+        return False
+    try:
+        body, sig = token.split(".", 1)
+        expected = _b64url(hmac.new(
+            MYCASES_SESSION_SECRET.encode("utf-8"),
+            body.encode("ascii"),
+            hashlib.sha256
+        ).digest())
+        if not hmac.compare_digest(sig, expected):
+            return False
+        payload = json.loads(_b64url_decode(body).decode("utf-8"))
+        return int(payload.get("exp", 0)) > int(datetime.now(timezone.utc).timestamp())
+    except Exception:
+        return False
+
+def _authorized(req) -> bool:
+    header = req.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return False
+    return _valid_token(header[7:].strip())
+
+def _require_auth():
+    if _authorized(request):
+        return None
+    return jsonify({"error": "Authentication required"}), 401
+
+def _sheet_service():
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not raw:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not configured")
+    info = json.loads(raw)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+def _row_to_case(row):
+    padded = list(row) + [""] * (len(MYCASES_FIELDS) - len(row))
+    return {key: padded[i] if i < len(padded) else "" for i, key in enumerate(MYCASES_FIELDS)}
+
+def _case_to_row(item):
+    return [str(item.get(key, "") or "") for key in MYCASES_FIELDS]
+
+def _clean_case(data, existing=None):
+    existing = existing or {}
+    now = datetime.now(timezone.utc).isoformat()
+    item = {}
+    for key in MYCASES_FIELDS:
+        if key in ("createdAt", "updatedAt"):
+            continue
+        value = data.get(key, "") if isinstance(data, dict) else ""
+        item[key] = str(value).strip() if value is not None else ""
+    item["id"] = item.get("id") or existing.get("id") or f"case_{uuid.uuid4().hex}"
+    item["createdAt"] = existing.get("createdAt") or str(data.get("createdAt", "") or "") or now
+    item["updatedAt"] = now
+    return item
+
+def _read_cases():
+    if not MYCASES_SHEET_ID:
+        raise RuntimeError("GOOGLE_SHEET_ID is not configured")
+    service = _sheet_service()
+    result = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=f"{MYCASES_SHEET_NAME}!A2:R"
+    ).execute()
+    rows = result.get("values", [])
+    return [_row_to_case(row) for row in rows if any(str(v).strip() for v in row)]
+
+def _find_case(case_id):
+    cases = _read_cases()
+    for idx, item in enumerate(cases):
+        if item.get("id") == case_id:
+            return cases, idx, idx + 2, item
+    return cases, -1, None, None
+
+@api_app.get("/health")
+def mycases_health():
+    return jsonify({
+        "ok": True,
+        "service": "cdr-pdf-bot+mycases-api",
+        "sheetConfigured": bool(MYCASES_SHEET_ID),
+        "googleCredentialConfigured": bool(os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")),
+        "passwordConfigured": bool(MYCASES_PASSWORD),
+    })
+
+@api_app.post("/api/login")
+def mycases_login():
+    if not MYCASES_PASSWORD or not MYCASES_SESSION_SECRET:
+        return jsonify({"error": "Authentication is not configured"}), 503
+    supplied = str((request.get_json(silent=True) or {}).get("password", ""))
+    if not hmac.compare_digest(supplied.encode("utf-8"), MYCASES_PASSWORD.encode("utf-8")):
+        return jsonify({"error": "Invalid password"}), 401
+    return jsonify({"ok": True, "token": _issue_token(), "expiresInHours": MYCASES_TOKEN_HOURS})
+
+@api_app.get("/api/session")
+def mycases_session():
+    return jsonify({"authenticated": _authorized(request)})
+
+@api_app.get("/api/cases")
+def mycases_list():
+    denied = _require_auth()
+    if denied:
+        return denied
+    try:
+        return jsonify({"cases": _read_cases()})
+    except Exception as exc:
+        logging.exception("My Cases list failed")
+        return jsonify({"error": str(exc)}), 500
+
+@api_app.post("/api/cases")
+def mycases_create():
+    denied = _require_auth()
+    if denied:
+        return denied
+    try:
+        item = _clean_case(request.get_json(silent=True) or {})
+        service = _sheet_service()
+        service.spreadsheets().values().append(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=f"{MYCASES_SHEET_NAME}!A:R",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [_case_to_row(item)]}
+        ).execute()
+        return jsonify({"case": item}), 201
+    except Exception as exc:
+        logging.exception("My Cases create failed")
+        return jsonify({"error": str(exc)}), 500
+
+@api_app.put("/api/cases/<case_id>")
+def mycases_update(case_id):
+    denied = _require_auth()
+    if denied:
+        return denied
+    try:
+        cases, idx, row_number, existing = _find_case(case_id)
+        if idx < 0:
+            return jsonify({"error": "Case not found"}), 404
+        data = request.get_json(silent=True) or {}
+        data["id"] = case_id
+        item = _clean_case(data, existing)
+        service = _sheet_service()
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=f"{MYCASES_SHEET_NAME}!A{row_number}:R{row_number}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [_case_to_row(item)]}
+        ).execute()
+        return jsonify({"case": item})
+    except Exception as exc:
+        logging.exception("My Cases update failed")
+        return jsonify({"error": str(exc)}), 500
+
+@api_app.delete("/api/cases/<case_id>")
+def mycases_delete(case_id):
+    denied = _require_auth()
+    if denied:
+        return denied
+    try:
+        cases, idx, row_number, existing = _find_case(case_id)
+        if idx < 0:
+            return jsonify({"error": "Case not found"}), 404
+        service = _sheet_service()
+        metadata = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+        target = next(
+            (s for s in metadata.get("sheets", []) if s.get("properties", {}).get("title") == MYCASES_SHEET_NAME),
+            None
+        )
+        if not target:
+            return jsonify({"error": "Cases sheet not found"}), 500
+        sheet_id = target["properties"]["sheetId"]
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests": [{
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_number - 1,
+                        "endIndex": row_number
+                    }
+                }
+            }]}
+        ).execute()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        logging.exception("My Cases delete failed")
+        return jsonify({"error": str(exc)}), 500
+
+def start_mycases_api():
+    port = int(os.environ.get("PORT", "8080"))
+    api_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelled. Send a mobile number or IMEI to start again.")
@@ -438,6 +692,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set.")
+
+    api_thread = threading.Thread(target=start_mycases_api, daemon=True)
+    api_thread.start()
+
     app = Application.builder().token(TOKEN).build()
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start), CommandHandler("add", add_after_pdf), CommandHandler("change", change_number), CommandHandler("remove", remove_number), MessageHandler(filters.TEXT & ~filters.COMMAND, begin)],
