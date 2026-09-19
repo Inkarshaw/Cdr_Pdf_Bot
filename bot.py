@@ -141,16 +141,6 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # After station is resolved, accept the mobile number / IMEI.
-    if context.user_data.get("station"):
-        kind, value = identifier(text)
-        if not kind:
-            await update.message.reply_text("Send a valid 10-digit mobile number or 15-digit IMEI.")
-            return STATION_STEP
-        context.user_data.update(kind=kind, number=value)
-        await update.message.reply_text("Enter Crime Number with year (example: 43/2026):")
-        return CRIME
-
     code = re.sub(r"[^A-Z0-9]", "", text.upper())
     aliases = {
         "G7": "G7 Chetpet PS (L&O)",
@@ -175,10 +165,10 @@ async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
         to_address=to_address
     )
     await update.message.reply_text(
-        f"Selected: {station}\n\nSend a 10-digit mobile number or 15-digit IMEI:",
+        f"Selected: {station}\n\nEnter Crime Number with year (example: 43/2026):",
         reply_markup=ReplyKeyboardRemove()
     )
-    return STATION_STEP
+    return CRIME
 
 async def crime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     v = update.message.text.strip()
@@ -213,22 +203,75 @@ async def to_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Enter DD/MM/YYYY or type TILL.")
             return TO_DATE
         context.user_data["to_date"] = d
-    await update.message.reply_text("Whose/How related? (example: Suspect / Victim / Witness):")
+    await update.message.reply_text(
+        "Send all mobile numbers / IMEIs in ONE message, one per line.\n"
+        "You can add the relation after each number.\n\n"
+        "Example:\n"
+        "9876543210 Suspect\n"
+        "9123456789 Victim\n"
+        "123456789012345 Witness"
+    )
     return RELATION
 
 async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["relation"] = update.message.text.strip()
-    item = {
-        "number": context.user_data["number"],
+    lines = [x.strip() for x in update.message.text.splitlines() if x.strip()]
+    items = []
+    invalid = []
+
+    for line in lines:
+        m = re.match(r"^(\\d{10}|\\d{15})(?:\\s*[|,\\-]\\s*|\\s+)?(.*)$", line)
+        if not m:
+            invalid.append(line)
+            continue
+        number = m.group(1)
+        relation_text = m.group(2).strip() or "-"
+        kind, value = identifier(number)
+        if not kind:
+            invalid.append(line)
+            continue
+        items.append({
+            "number": value,
+            "from_date": context.user_data["from_date"],
+            "to_date": context.user_data["to_date"],
+            "relation": relation_text,
+        })
+
+    if invalid or not items:
+        msg = "I couldn't read these lines:\n" + "\n".join(invalid or lines)
+        msg += "\n\nUse one per line, for example:\n9876543210 Suspect\n123456789012345 Witness"
+        await update.message.reply_text(msg)
+        return RELATION
+
+    existing_items = list(context.user_data.get("items", []))
+    items = existing_items + items
+    context.user_data["items"] = items
+    context.user_data["number"] = items[0]["number"]
+    context.user_data["relation"] = items[0]["relation"]
+    context.user_data.setdefault("station", STATION)
+    context.user_data.setdefault("from_address", FROM_ADDRESS)
+    context.user_data.setdefault("to_address", TO_ADDRESS)
+
+    pdf = build_pdf(context.user_data)
+    name = f"CDR_Request_{context.user_data['crime'].replace('/', '_')}.pdf"
+    await update.message.reply_document(
+        document=pdf,
+        filename=name,
+        caption=f"PDF generated with {len(items)} number(s). To add more later, send /add."
+    )
+
+    saved = {
+        "station": context.user_data.get("station", STATION),
+        "from_address": context.user_data.get("from_address", FROM_ADDRESS),
+        "to_address": context.user_data.get("to_address", TO_ADDRESS),
+        "crime": context.user_data["crime"],
+        "section": context.user_data["section"],
         "from_date": context.user_data["from_date"],
         "to_date": context.user_data["to_date"],
-        "relation": context.user_data["relation"],
+        "items": list(items),
     }
-    context.user_data.setdefault("items", []).append(item)
-    await update.message.reply_text(
-        f"Added {context.user_data['number']}.\n\nAdd another mobile/IMEI with the same Crime No., Section and Police Station? Type YES or NO."
-    )
-    return ADD_MORE
+    context.user_data.clear()
+    context.user_data["last_request"] = saved
+    return ConversationHandler.END
 
 async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.message.text.strip().upper()
@@ -280,9 +323,11 @@ async def add_after_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data.update(saved)
     await update.message.reply_text(
-        f"Adding to Cr.No. {saved['crime']} U/s {saved['section']}.\n\nSend the next 10-digit mobile number or 15-digit IMEI:"
+        f"Adding to Cr.No. {saved['crime']} U/s {saved['section']}.\n"
+        f"Date range: {saved.get('from_date', '-')} to {saved.get('to_date', '-')}\n\n"
+        "Send the additional number(s) in ONE message, one per line."
     )
-    return ADD_MORE
+    return RELATION
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
