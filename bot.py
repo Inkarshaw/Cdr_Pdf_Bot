@@ -29,7 +29,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-STATION_STEP, CRIME, SECTION, FROM_DATE, TO_DATE, RELATION, ADD_MORE, CHANGE_NUMBER, REMOVE_NUMBER = range(9)
+FLOW_SELECT, STATION_STEP, CRIME, SECTION, FROM_DATE, TO_DATE, RELATION, ADD_MORE, CHANGE_NUMBER, REMOVE_NUMBER, BANK_NAME, BANK_REQUEST_TYPE, BANK_IDENTIFIERS, BANK_START_DATE, BANK_EMAIL = range(15)
 
 STATION = "G7 Chetpet PS (L&O)"
 FROM_ADDRESS = "Inspector of Police,<br/>G7 Chetpet PS (L&O),<br/>Chetpet, Chennai - 31."
@@ -48,6 +48,24 @@ STATIONS = {
         "Inspector of Police,<br/>G3 Kilpauk PS (L&O),<br/>Chennai.",
         "The Deputy Commissioner of Police,<br/>Kilpauk District,<br/>Chennai - 600010."
     ),
+}
+
+BANK_STATION_META = {
+    "G7 Chetpet PS (L&O)": {
+        "district": "Kilpauk District",
+        "from_address": "The Inspector of Police,<br/>G7 Chetpet PS (L&O),<br/>Chetpet, Chennai - 31.",
+        "default_email": "g7chetpetps@gmail.com",
+    },
+    "G5 Secretariat Colony PS": {
+        "district": "Kilpauk District",
+        "from_address": "The Inspector of Police,<br/>G5 Secretariat Colony PS,<br/>Chennai.",
+        "default_email": "",
+    },
+    "G3 Kilpauk PS (L&O)": {
+        "district": "Kilpauk District",
+        "from_address": "The Inspector of Police,<br/>G3 Kilpauk PS (L&O),<br/>Chennai.",
+        "default_email": "",
+    },
 }
 
 def identifier(text):
@@ -131,21 +149,202 @@ def build_pdf(d):
     buf.seek(0)
     return buf
 
+
+def build_bank_pdf(d):
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        rightMargin=25*mm,
+        leftMargin=25*mm,
+        topMargin=10*mm,
+        bottomMargin=20*mm,
+    )
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle(
+        "bank_normal",
+        parent=styles["Normal"],
+        fontName="Times-Roman",
+        fontSize=11,
+        leading=16,
+        spaceAfter=3,
+    )
+    bold = ParagraphStyle(
+        "bank_bold",
+        parent=normal,
+        fontName="Times-Bold",
+    )
+    centered = ParagraphStyle(
+        "bank_center",
+        parent=bold,
+        alignment=1,
+        fontSize=13,
+        leading=16,
+    )
+    right = ParagraphStyle("bank_right", parent=normal, alignment=TA_RIGHT)
+    indent = ParagraphStyle("bank_indent", parent=normal, leftIndent=10*mm)
+    subject_style = ParagraphStyle("bank_subject", parent=normal, leftIndent=10*mm)
+
+    story = [
+        Paragraph("<u>POLICE DEPARTMENT</u>", centered),
+        Paragraph("(U/S.94 BNSS)", ParagraphStyle("bank_subhead", parent=normal, alignment=1)),
+        Spacer(1, 2*mm),
+        Paragraph("Date: " + datetime.now().strftime("%d/%m/%Y"), right),
+        Spacer(1, 3*mm),
+        Paragraph("From", normal),
+        Paragraph(d["bank_from_address"], indent),
+        Spacer(1, 2*mm),
+        Paragraph("To", normal),
+        Paragraph(f"The Branch Manager,<br/>{d['bank_name']}", indent),
+        Spacer(1, 3*mm),
+        Paragraph("Sir/Madam,", normal),
+    ]
+
+    is_mobile = d.get("request_type") == "mobile"
+    if is_mobile:
+        subject = "Request to furnish the Bank Account details linked with the below mentioned Phone Number(s)"
+    else:
+        subject = "Request to furnish the transaction details of account numbers"
+
+    story.append(Paragraph(
+        f"Sub: Chennai Police -- {d['district']} -- Cyber Crime Team -- {subject} -- Reg.",
+        subject_style,
+    ))
+    story.append(Paragraph(
+        f"Ref: {d['station']} Cr.No.{d['crime']}, U/s. {d['section']}",
+        subject_style,
+    ))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph("*****", ParagraphStyle("bank_stars", parent=bold, alignment=1)))
+    story.append(Spacer(1, 2*mm))
+
+    items = d.get("items", [])
+    if is_mobile:
+        phone_word = "Phone Numbers" if len(items) > 1 else "Phone Number"
+        case_text = (
+            f"I am enquiring the case mentioned in the above reference, {d['case_type']} case was "
+            f"registered at {d['station']}, {d['district']}, Chennai City.<br/><br/>"
+            f"Hence I request you to furnish the details of the Bank Account Linked with the below mentioned "
+            f"{phone_word} for further investigation purpose."
+        )
+        header = "Mobile Details"
+        value_label = "Mobile No"
+    else:
+        account_word = "accounts were" if len(items) > 1 else "account was"
+        account_request_word = "bank accounts" if len(items) > 1 else "bank account"
+        case_text = (
+            f"I am enquiring the case mentioned in the above reference, {d['case_type']} case was "
+            f"registered at {d['station']}, {d['district']}, Chennai City and we found below mentioned "
+            f"{d['bank_name']} Bank {account_word} involved in this case.<br/><br/>"
+            f"Hence I request you to furnish the details of below mentioned {account_request_word} "
+            f"for further investigation purpose."
+        )
+        header = "Account Details"
+        value_label = "A/c No"
+
+    story.append(Paragraph(case_text, normal))
+    story.append(Spacer(1, 3*mm))
+
+    data = [["Sl.no", header]]
+    for i, item in enumerate(items, 1):
+        data.append([str(i), f"{value_label}: {item['number']}"])
+
+    table = Table(data, colWidths=[22*mm, 115*mm], repeatRows=1, hAlign="CENTER")
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("FONTNAME", (0, 0), (-1, 0), "Times-Bold"),
+        ("FONTNAME", (0, 1), (-1, -1), "Times-Roman"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph("<b>Further you are directed to:</b>", normal))
+    story.append(Paragraph(
+        "1. Furnish the Beneficiary <b>(KYC)</b> name and address, IP Details, Email ID, Merchant ID, "
+        "other contact details of Beneficiary",
+        normal,
+    ))
+    story.append(Paragraph(
+        f"2. <b>Provide the account statement from {d['start_date']} to till date through the Email id: "
+        f"{d['email']}</b>",
+        normal,
+    ))
+    story.append(Paragraph(
+        "3. Furnish the Contact details of acquiring bank details and E-mail id.",
+        normal,
+    ))
+    story.append(Spacer(1, 7*mm))
+    story.append(Paragraph("With Regards", right))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
-        "Enter Police Station code (example: G7):",
+        "What do you want to create?\n\nType CDR or BANK:",
         reply_markup=ReplyKeyboardRemove()
     )
+    return FLOW_SELECT
+
+async def cdr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data["flow"] = "cdr"
+    await update.message.reply_text("Enter Police Station code (example: G7):", reply_markup=ReplyKeyboardRemove())
     return STATION_STEP
 
+async def bank_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data["flow"] = "bank"
+    await update.message.reply_text("Enter Police Station code (example: G7):", reply_markup=ReplyKeyboardRemove())
+    return STATION_STEP
+
+async def flow_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    if text in ("cdr", "call", "call details"):
+        context.user_data["flow"] = "cdr"
+        await update.message.reply_text("Enter Police Station code (example: G7):")
+        return STATION_STEP
+    if text in ("bank", "bank request", "bankrequest"):
+        context.user_data["flow"] = "bank"
+        await update.message.reply_text("Enter Police Station code (example: G7):")
+        return STATION_STEP
+
+    kind, value = identifier(update.message.text)
+    if kind:
+        context.user_data.clear()
+        context.user_data.update(
+            flow="cdr",
+            kind=kind,
+            number=value,
+            station=STATION,
+            from_address=FROM_ADDRESS,
+            to_address=TO_ADDRESS,
+        )
+        await update.message.reply_text("Enter Crime Number with year (example: 43/2026):")
+        return CRIME
+
+    await update.message.reply_text("Type CDR or BANK.")
+    return FLOW_SELECT
+
 async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    if text in ("bank", "bank request", "bankrequest"):
+        return await bank_start(update, context)
+    if text in ("cdr", "call", "call details"):
+        return await cdr_start(update, context)
+
     kind, value = identifier(update.message.text)
     if not kind:
-        await update.message.reply_text("Send a valid 10-digit mobile number or 15-digit IMEI.")
+        await update.message.reply_text("Send /start, type BANK or CDR, or send a valid 10-digit mobile number / 15-digit IMEI.")
         return ConversationHandler.END
     context.user_data.clear()
-    context.user_data.update(kind=kind, number=value, station=STATION, from_address=FROM_ADDRESS, to_address=TO_ADDRESS)
+    context.user_data.update(flow="cdr", kind=kind, number=value, station=STATION, from_address=FROM_ADDRESS, to_address=TO_ADDRESS)
     await update.message.reply_text("Enter Crime Number with year (example: 43/2026):")
     return CRIME
 
@@ -175,6 +374,11 @@ async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_address=from_address,
         to_address=to_address
     )
+    if context.user_data.get("flow") == "bank":
+        meta = BANK_STATION_META.get(station, {})
+        context.user_data["district"] = meta.get("district", "Kilpauk District")
+        context.user_data["bank_from_address"] = meta.get("from_address", from_address)
+        context.user_data["default_email"] = meta.get("default_email", "")
     await update.message.reply_text(
         f"Selected: {station}\n\nEnter Crime Number with year (example: 43/2026):",
         reply_markup=ReplyKeyboardRemove()
@@ -192,6 +396,9 @@ async def crime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def section(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["section"] = update.message.text.strip()
+    if context.user_data.get("flow") == "bank":
+        await update.message.reply_text("Enter Case Type (example: NDPS):")
+        return BANK_NAME
     await update.message.reply_text("Enter From Date (DD/MM/YYYY):")
     return FROM_DATE
 
@@ -279,9 +486,159 @@ async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "from_date": context.user_data["from_date"],
         "to_date": context.user_data["to_date"],
         "items": list(items),
+        "request_kind": "cdr",
     }
     context.user_data.clear()
     context.user_data["last_request"] = saved
+    context.user_data["last_kind"] = "cdr"
+    return ConversationHandler.END
+
+
+async def bank_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    case_type = update.message.text.strip()
+    if not case_type:
+        await update.message.reply_text("Enter the Case Type, for example: NDPS")
+        return BANK_NAME
+    context.user_data["case_type"] = case_type
+    await update.message.reply_text("Enter Bank Name (example: State Bank of India):")
+    return BANK_REQUEST_TYPE
+
+async def bank_request_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "bank_name" not in context.user_data:
+        bank_name = update.message.text.strip()
+        if not bank_name:
+            await update.message.reply_text("Enter the Bank Name.")
+            return BANK_REQUEST_TYPE
+        context.user_data["bank_name"] = bank_name
+        await update.message.reply_text("Request using ACCOUNT number or MOBILE number? Type ACCOUNT or MOBILE:")
+        return BANK_REQUEST_TYPE
+
+    text = update.message.text.strip().lower()
+    if text in ("account", "a", "bank account", "account number"):
+        context.user_data["request_type"] = "account"
+        await update.message.reply_text(
+            "Send all account number(s) in ONE message.\\n"
+            "Use spaces, commas, or new lines between numbers."
+        )
+        return BANK_IDENTIFIERS
+    if text in ("mobile", "m", "phone", "phone number"):
+        context.user_data["request_type"] = "mobile"
+        await update.message.reply_text(
+            "Send all 10-digit mobile number(s) in ONE message.\\n"
+            "Use spaces, commas, or new lines between numbers."
+        )
+        return BANK_IDENTIFIERS
+
+    await update.message.reply_text("Type ACCOUNT or MOBILE.")
+    return BANK_REQUEST_TYPE
+
+def _parse_bank_identifiers(text, request_type):
+    tokens = [x for x in re.split(r"[\\s,;]+", (text or "").strip()) if x]
+    if not tokens:
+        return [], []
+    valid = []
+    invalid = []
+    for token in tokens:
+        if request_type == "mobile":
+            if re.fullmatch(r"\\d{10}", token):
+                valid.append(token)
+            else:
+                invalid.append(token)
+        else:
+            if re.fullmatch(r"\\d{6,30}", token):
+                valid.append(token)
+            else:
+                invalid.append(token)
+    return valid, invalid
+
+async def bank_identifiers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    request_type = context.user_data.get("request_type", "account")
+    valid, invalid = _parse_bank_identifiers(update.message.text, request_type)
+    if invalid or not valid:
+        label = "10-digit mobile numbers" if request_type == "mobile" else "numeric account numbers"
+        msg = "Invalid value(s): " + ", ".join(invalid or [update.message.text.strip()])
+        msg += f"\\n\\nSend only {label}, separated by spaces, commas, or new lines."
+        await update.message.reply_text(msg)
+        return BANK_IDENTIFIERS
+
+    existing = list(context.user_data.get("items", []))
+    existing_numbers = {item["number"] for item in existing}
+    for number in valid:
+        if number not in existing_numbers:
+            existing.append({"number": number})
+            existing_numbers.add(number)
+    context.user_data["items"] = existing
+
+    if context.user_data.get("bank_adding") and context.user_data.get("start_date") and context.user_data.get("email"):
+        pdf = build_bank_pdf(context.user_data)
+        name = f"Bank_Request_{context.user_data['crime'].replace('/', '_')}.pdf"
+        await update.message.reply_document(
+            document=pdf,
+            filename=name,
+            caption=f"Updated Bank Request PDF generated with {len(existing)} number(s).",
+        )
+        saved = dict(context.user_data)
+        saved["items"] = list(existing)
+        saved["request_kind"] = "bank"
+        saved.pop("bank_adding", None)
+        context.user_data.clear()
+        context.user_data["last_request"] = saved
+        context.user_data["last_kind"] = "bank"
+        return ConversationHandler.END
+
+    await update.message.reply_text("Enter Statement Start Date (DD/MM/YYYY):")
+    return BANK_START_DATE
+
+async def bank_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = parse_date(update.message.text)
+    if not d:
+        await update.message.reply_text("Invalid date. Enter as DD/MM/YYYY.")
+        return BANK_START_DATE
+    context.user_data["start_date"] = d
+
+    default_email = context.user_data.get("default_email", "")
+    if default_email:
+        await update.message.reply_text(
+            f"Enter Email ID for the statement, or type DEFAULT to use {default_email}:"
+        )
+    else:
+        await update.message.reply_text("Enter Email ID for the statement:")
+    return BANK_EMAIL
+
+async def bank_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    default_email = context.user_data.get("default_email", "")
+    if text.upper() == "DEFAULT" and default_email:
+        email = default_email
+    else:
+        email = text
+
+    if not re.fullmatch(r"[^\\s@]+@[^\\s@]+\\.[^\\s@]+", email):
+        await update.message.reply_text("Enter a valid email address.")
+        return BANK_EMAIL
+
+    context.user_data["email"] = email
+    context.user_data.setdefault("district", "Kilpauk District")
+    context.user_data.setdefault("bank_from_address", context.user_data.get("from_address", FROM_ADDRESS))
+    context.user_data["request_kind"] = "bank"
+
+    pdf = build_bank_pdf(context.user_data)
+    name = f"Bank_Request_{context.user_data['crime'].replace('/', '_')}.pdf"
+    await update.message.reply_document(
+        document=pdf,
+        filename=name,
+        caption=(
+            f"Bank Request PDF generated with {len(context.user_data.get('items', []))} number(s). "
+            "Use /add, /change, or /remove to edit the last request."
+        ),
+    )
+
+    saved = dict(context.user_data)
+    saved["items"] = list(context.user_data.get("items", []))
+    saved["request_kind"] = "bank"
+    context.user_data.clear()
+    context.user_data["last_request"] = saved
+    context.user_data["last_kind"] = "bank"
     return ConversationHandler.END
 
 async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,9 +666,11 @@ async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "crime": context.user_data["crime"],
             "section": context.user_data["section"],
             "items": list(context.user_data.get("items", [])),
+            "request_kind": "cdr",
         }
         context.user_data.clear()
         context.user_data["last_request"] = saved
+        context.user_data["last_kind"] = "cdr"
         return ConversationHandler.END
 
     kind, value = identifier(update.message.text)
@@ -331,8 +690,22 @@ async def add_after_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not saved:
         await update.message.reply_text("No previous PDF request is available. Send /start to create a new request.")
         return ConversationHandler.END
+
+    request_kind = saved.get("request_kind", context.user_data.get("last_kind", "cdr"))
     context.user_data.clear()
     context.user_data.update(saved)
+
+    if request_kind == "bank":
+        context.user_data["flow"] = "bank"
+        context.user_data["bank_adding"] = True
+        label = "mobile number(s)" if saved.get("request_type") == "mobile" else "account number(s)"
+        await update.message.reply_text(
+            f"Adding to Bank Request for Cr.No. {saved['crime']}.\n"
+            f"Send the additional {label} in ONE message."
+        )
+        return BANK_IDENTIFIERS
+
+    context.user_data["flow"] = "cdr"
     await update.message.reply_text(
         f"Adding to Cr.No. {saved['crime']} U/s {saved['section']}.\n"
         f"Date range: {saved.get('from_date', '-')} to {saved.get('to_date', '-')}\n\n"
@@ -346,22 +719,32 @@ async def change_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No previous PDF request is available. Send /start to create one.")
         return ConversationHandler.END
 
+    request_kind = saved.get("request_kind", context.user_data.get("last_kind", "cdr"))
     rows = []
     for i, item in enumerate(saved["items"], 1):
-        rows.append(f"{i}. {item['number']} - {item.get('relation', '-')}")
+        if request_kind == "bank":
+            rows.append(f"{i}. {item['number']}")
+        else:
+            rows.append(f"{i}. {item['number']} - {item.get('relation', '-')}")
+    if request_kind == "bank":
+        expected = "new mobile number" if saved.get("request_type") == "mobile" else "new account number"
+        example = "2 9876543210" if saved.get("request_type") == "mobile" else "2 38625685574"
+        prompt = f"Send: row number + {expected}\nExample: {example}"
+    else:
+        prompt = "Send: row number + new mobile/IMEI\nExample: 2 9876543210"
     await update.message.reply_text(
         "Which number do you want to change?\n\n" +
         "\n".join(rows) +
-        "\n\nSend: row number + new mobile/IMEI\nExample: 2 9876543210"
+        "\n\n" + prompt
     )
     return CHANGE_NUMBER
 
 async def change_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saved = context.user_data.get("last_request")
     text = update.message.text.strip()
-    m = re.fullmatch(r"(\d+)\s+(\d{10}|\d{15})", text)
+    m = re.fullmatch(r"(\d+)\s+(\d+)", text)
     if not m:
-        await update.message.reply_text("Use: row number + new mobile/IMEI\nExample: 2 9876543210")
+        await update.message.reply_text("Use: row number + new number. Example: 2 9876543210")
         return CHANGE_NUMBER
 
     row = int(m.group(1))
@@ -370,23 +753,40 @@ async def change_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"Choose a row from 1 to {len(saved['items'])}.")
         return CHANGE_NUMBER
 
-    kind, value = identifier(new_number)
-    if not kind:
-        await update.message.reply_text("Enter a valid 10-digit mobile number or 15-digit IMEI.")
-        return CHANGE_NUMBER
+    request_kind = saved.get("request_kind", context.user_data.get("last_kind", "cdr"))
+    if request_kind == "bank":
+        if saved.get("request_type") == "mobile":
+            valid = bool(re.fullmatch(r"\d{10}", new_number))
+            error = "Enter a valid 10-digit mobile number."
+        else:
+            valid = bool(re.fullmatch(r"\d{6,30}", new_number))
+            error = "Enter a valid numeric account number."
+        if not valid:
+            await update.message.reply_text(error)
+            return CHANGE_NUMBER
+        value = new_number
+    else:
+        kind, value = identifier(new_number)
+        if not kind:
+            await update.message.reply_text("Enter a valid 10-digit mobile number or 15-digit IMEI.")
+            return CHANGE_NUMBER
 
     old_number = saved["items"][row - 1]["number"]
     saved["items"][row - 1]["number"] = value
     context.user_data["last_request"] = saved
 
-    pdf_data = dict(saved)
-    pdf_data["number"] = saved["items"][0]["number"]
-    pdf_data["relation"] = saved["items"][0].get("relation", "-")
-    pdf_data["from_date"] = saved.get("from_date", saved["items"][0]["from_date"])
-    pdf_data["to_date"] = saved.get("to_date", saved["items"][0]["to_date"])
+    if request_kind == "bank":
+        pdf = build_bank_pdf(saved)
+        name = f"Bank_Request_{saved['crime'].replace('/', '_')}.pdf"
+    else:
+        pdf_data = dict(saved)
+        pdf_data["number"] = saved["items"][0]["number"]
+        pdf_data["relation"] = saved["items"][0].get("relation", "-")
+        pdf_data["from_date"] = saved.get("from_date", saved["items"][0]["from_date"])
+        pdf_data["to_date"] = saved.get("to_date", saved["items"][0]["to_date"])
+        pdf = build_pdf(pdf_data)
+        name = f"CDR_Request_{saved['crime'].replace('/', '_')}.pdf"
 
-    pdf = build_pdf(pdf_data)
-    name = f"CDR_Request_{saved['crime'].replace('/', '_')}.pdf"
     await update.message.reply_document(
         document=pdf,
         filename=name,
@@ -400,7 +800,11 @@ async def remove_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No previous PDF request is available. Send /start to create one.")
         return ConversationHandler.END
 
-    rows = [f"{i}. {item['number']} - {item.get('relation', '-')}" for i, item in enumerate(saved["items"], 1)]
+    request_kind = saved.get("request_kind", context.user_data.get("last_kind", "cdr"))
+    if request_kind == "bank":
+        rows = [f"{i}. {item['number']}" for i, item in enumerate(saved["items"], 1)]
+    else:
+        rows = [f"{i}. {item['number']} - {item.get('relation', '-')}" for i, item in enumerate(saved["items"], 1)]
     await update.message.reply_text(
         "Which number do you want to remove?\n\n" +
         "\n".join(rows) +
@@ -426,14 +830,18 @@ async def remove_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
     removed = saved["items"].pop(row - 1)
     context.user_data["last_request"] = saved
 
-    pdf_data = dict(saved)
-    pdf_data["number"] = saved["items"][0]["number"]
-    pdf_data["relation"] = saved["items"][0].get("relation", "-")
-    pdf_data["from_date"] = saved.get("from_date", saved["items"][0]["from_date"])
-    pdf_data["to_date"] = saved.get("to_date", saved["items"][0]["to_date"])
-
-    pdf = build_pdf(pdf_data)
-    name = f"CDR_Request_{saved['crime'].replace('/', '_')}.pdf"
+    request_kind = saved.get("request_kind", context.user_data.get("last_kind", "cdr"))
+    if request_kind == "bank":
+        pdf = build_bank_pdf(saved)
+        name = f"Bank_Request_{saved['crime'].replace('/', '_')}.pdf"
+    else:
+        pdf_data = dict(saved)
+        pdf_data["number"] = saved["items"][0]["number"]
+        pdf_data["relation"] = saved["items"][0].get("relation", "-")
+        pdf_data["from_date"] = saved.get("from_date", saved["items"][0]["from_date"])
+        pdf_data["to_date"] = saved.get("to_date", saved["items"][0]["to_date"])
+        pdf = build_pdf(pdf_data)
+        name = f"CDR_Request_{saved['crime'].replace('/', '_')}.pdf"
     await update.message.reply_document(
         document=pdf,
         filename=name,
@@ -686,7 +1094,7 @@ def start_mycases_api():
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Cancelled. Send a mobile number or IMEI to start again.")
+    await update.message.reply_text("Cancelled. Send /start to begin again.")
     return ConversationHandler.END
 
 def main():
@@ -698,8 +1106,17 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start), CommandHandler("add", add_after_pdf), CommandHandler("change", change_number), CommandHandler("remove", remove_number), MessageHandler(filters.TEXT & ~filters.COMMAND, begin)],
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("cdr", cdr_start),
+            CommandHandler("bank", bank_start),
+            CommandHandler("add", add_after_pdf),
+            CommandHandler("change", change_number),
+            CommandHandler("remove", remove_number),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, begin),
+        ],
         states={
+            FLOW_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, flow_select)],
             STATION_STEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, station_step)],
             CRIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, crime)],
             SECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, section)],
@@ -709,6 +1126,11 @@ def main():
             ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_more)],
             CHANGE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_number_step)],
             REMOVE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_number_step)],
+            BANK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_name)],
+            BANK_REQUEST_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_request_type)],
+            BANK_IDENTIFIERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_identifiers)],
+            BANK_START_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_start_date)],
+            BANK_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_email)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
