@@ -448,7 +448,9 @@ def main():
             FROM_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, from_date)],
             TO_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, to_date)],
             RELATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, relation)],
-            ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_more)],\n            CHANGE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_number_step)],\n            REMOVE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_number_step)],
+            ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_more)],
+            CHANGE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_number_step)],
+            REMOVE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_number_step)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
