@@ -1,2 +1,6 @@
 python-telegram-bot==22.5
 reportlab==4.4.4
+Flask==3.1.2
+flask-cors==6.0.1
+google-api-python-client==2.181.0
+google-auth==2.40.3
