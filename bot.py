@@ -2042,6 +2042,69 @@ async def bank_status_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
+
+def _split_lines(value):
+    return [x.strip() for x in str(value or "").splitlines() if x.strip()]
+
+def _backfill_item_trackers():
+    # Backfill older parent rows that existed before per-item tracking was added.
+    try:
+        for _, row in _read_cdr_rows():
+            request_id = row.get("Request ID", "")
+            if not request_id or _read_item_rows("cdr", request_id=request_id):
+                continue
+            numbers = _split_lines(row.get("Mobile / IMEI", ""))
+            relations = _split_lines(row.get("Relation", ""))
+            from_dates = _split_lines(row.get("From Date", ""))
+            to_dates = _split_lines(row.get("To Date", ""))
+            items = []
+            for i, number in enumerate(numbers):
+                items.append({
+                    "number": number,
+                    "relation": relations[i] if i < len(relations) else (relations[0] if relations else "-"),
+                    "from_date": from_dates[i] if i < len(from_dates) else (from_dates[0] if from_dates else ""),
+                    "to_date": to_dates[i] if i < len(to_dates) else (to_dates[0] if to_dates else ""),
+                })
+            if not items:
+                continue
+            data = {
+                "crime": row.get("Crime No.", ""),
+                "section": row.get("Sections", ""),
+                "station": row.get("Police Station", ""),
+                "items": items,
+            }
+            _sync_request_items("cdr", data, request_id, row.get("Telegram User ID", ""))
+            if row.get("Status") in ("Sent", "Received"):
+                _bulk_item_status("cdr", request_id, row.get("Status"))
+
+        for _, row in _read_bank_tracking_rows():
+            request_id = row.get("Request ID", "")
+            if not request_id or _read_item_rows("bank", request_id=request_id):
+                continue
+            numbers = _split_lines(row.get("Account / Mobile Numbers", ""))
+            items = [{"number": number} for number in numbers]
+            if not items:
+                continue
+            data = {
+                "crime": row.get("Crime No.", ""),
+                "section": row.get("Sections", ""),
+                "station": row.get("Police Station", ""),
+                "case_type": row.get("Case Type", ""),
+                "bank_name": row.get("Bank Name", ""),
+                "request_type": "mobile" if row.get("Request Type") == "Mobile Number" else "account",
+                "start_date": row.get("Statement From", ""),
+                "email": row.get("Email", ""),
+                "items": items,
+            }
+            _sync_request_items("bank", data, request_id, row.get("Telegram User ID", ""))
+            if row.get("Status") in ("Sent", "Received"):
+                _bulk_item_status("bank", request_id, row.get("Status"))
+    except Exception:
+        logging.exception("Item tracker backfill failed")
+
+async def item_tracker_backfill_job(context: ContextTypes.DEFAULT_TYPE):
+    _backfill_item_trackers()
+
 # ---------------------------------------------------------------------------
 # Automatic overdue reminders
 # ---------------------------------------------------------------------------
@@ -2488,6 +2551,11 @@ def main():
 
     if app.job_queue:
         ist = timezone(timedelta(hours=5, minutes=30))
+        app.job_queue.run_once(
+            item_tracker_backfill_job,
+            when=8,
+            name="item-tracker-backfill",
+        )
         app.job_queue.run_daily(
             overdue_reminder_job,
             time=dt_time(hour=9, minute=0, tzinfo=ist),
