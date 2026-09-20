@@ -461,6 +461,7 @@ async def to_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "9876543210 Suspect\n"
         "9123456789 Victim\n"
         "123456789012345 Witness\n\n"
+        "If you send only numbers, separated by spaces/new lines, all are treated as Suspect.\n"
         "Or type DRAFTS to use your saved CDR draft numbers."
     )
     return RELATION
@@ -495,31 +496,57 @@ async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "_draft_id": draft.get("Draft ID", ""),
             })
     else:
-        lines = [x.strip() for x in raw_text.splitlines() if x.strip()]
-
-        for line in lines:
-            m = re.match(r"^(\d{10}|\d{15})(?:\s*[|,\-]\s*|\s+)?(.*)$", line)
-            if not m:
-                invalid.append(line)
-                continue
-            number = m.group(1)
-            relation_text = m.group(2).strip() or "-"
-            kind, value = identifier(number)
+        # Fast entry: when the message contains only valid mobile/IMEI numbers,
+        # treat every number as a separate CDR item with relation "Suspect".
+        bare_tokens = [x for x in re.split(r"[\s,;]+", raw_text) if x]
+        bare_values = []
+        all_bare_numbers = bool(bare_tokens)
+        for token in bare_tokens:
+            kind, value = identifier(token)
             if not kind:
-                invalid.append(line)
-                continue
-            items.append({
-                "number": value,
-                "from_date": context.user_data["from_date"],
-                "to_date": context.user_data["to_date"],
-                "relation": relation_text,
-            })
+                all_bare_numbers = False
+                break
+            bare_values.append(value)
 
-        if invalid or not items:
-            msg = "I couldn't read these lines:\n" + "\n".join(invalid or lines)
-            msg += "\n\nUse one per line, for example:\n9876543210 Suspect\n123456789012345 Witness"
-            await update.message.reply_text(msg)
-            return RELATION
+        if all_bare_numbers:
+            for value in bare_values:
+                items.append({
+                    "number": value,
+                    "from_date": context.user_data["from_date"],
+                    "to_date": context.user_data["to_date"],
+                    "relation": "Suspect",
+                })
+        else:
+            lines = [x.strip() for x in raw_text.splitlines() if x.strip()]
+
+            for line in lines:
+                m = re.match(r"^(\d{10}|\d{15})(?:\s*[|,\-]\s*|\s+)?(.*)$", line)
+                if not m:
+                    invalid.append(line)
+                    continue
+                number = m.group(1)
+                relation_text = m.group(2).strip() or "Suspect"
+                kind, value = identifier(number)
+                if not kind:
+                    invalid.append(line)
+                    continue
+                items.append({
+                    "number": value,
+                    "from_date": context.user_data["from_date"],
+                    "to_date": context.user_data["to_date"],
+                    "relation": relation_text,
+                })
+
+            if invalid or not items:
+                msg = "I couldn't read these lines:\n" + "\n".join(invalid or lines)
+                msg += (
+                    "\n\nSend only numbers to mark all as Suspect, for example:\n"
+                    "7299557527 8610869339 9677667709\n\n"
+                    "Or use one per line with a relation:\n"
+                    "9876543210 Suspect\n123456789012345 Witness"
+                )
+                await update.message.reply_text(msg)
+                return RELATION
 
     existing_items = list(context.user_data.get("items", []))
     existing_numbers = {str(x.get("number", "")) for x in existing_items}
