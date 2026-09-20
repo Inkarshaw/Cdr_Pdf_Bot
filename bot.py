@@ -427,41 +427,74 @@ async def to_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Example:\n"
         "9876543210 Suspect\n"
         "9123456789 Victim\n"
-        "123456789012345 Witness"
+        "123456789012345 Witness\n\n"
+        "Or type DRAFTS to use your saved CDR draft numbers."
     )
     return RELATION
 
 async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = [x.strip() for x in update.message.text.splitlines() if x.strip()]
+    raw_text = update.message.text.strip()
     items = []
     invalid = []
 
-    for line in lines:
-        m = re.match(r"^(\d{10}|\d{15})(?:\s*[|,\-]\s*|\s+)?(.*)$", line)
-        if not m:
-            invalid.append(line)
-            continue
-        number = m.group(1)
-        relation_text = m.group(2).strip() or "-"
-        kind, value = identifier(number)
-        if not kind:
-            invalid.append(line)
-            continue
-        items.append({
-            "number": value,
-            "from_date": context.user_data["from_date"],
-            "to_date": context.user_data["to_date"],
-            "relation": relation_text,
-        })
+    if raw_text.upper() == "DRAFTS":
+        try:
+            drafts = _open_drafts_for_user(
+                getattr(update.effective_user, "id", ""),
+                purpose="CDR",
+            )
+        except Exception as exc:
+            logging.exception("Could not load CDR drafts")
+            await update.message.reply_text(f"Could not load drafts: {exc}")
+            return RELATION
+        if not drafts:
+            await update.message.reply_text(
+                "No open CDR draft numbers found.\n"
+                "Add one with /draftadd cdr 9876543210 Suspect"
+            )
+            return RELATION
+        for draft in drafts:
+            items.append({
+                "number": draft.get("Identifier", ""),
+                "from_date": context.user_data["from_date"],
+                "to_date": context.user_data["to_date"],
+                "relation": draft.get("Note / Relation", "") or "-",
+                "_draft_id": draft.get("Draft ID", ""),
+            })
+    else:
+        lines = [x.strip() for x in raw_text.splitlines() if x.strip()]
 
-    if invalid or not items:
-        msg = "I couldn't read these lines:\n" + "\n".join(invalid or lines)
-        msg += "\n\nUse one per line, for example:\n9876543210 Suspect\n123456789012345 Witness"
-        await update.message.reply_text(msg)
-        return RELATION
+        for line in lines:
+            m = re.match(r"^(\d{10}|\d{15})(?:\s*[|,\-]\s*|\s+)?(.*)$", line)
+            if not m:
+                invalid.append(line)
+                continue
+            number = m.group(1)
+            relation_text = m.group(2).strip() or "-"
+            kind, value = identifier(number)
+            if not kind:
+                invalid.append(line)
+                continue
+            items.append({
+                "number": value,
+                "from_date": context.user_data["from_date"],
+                "to_date": context.user_data["to_date"],
+                "relation": relation_text,
+            })
+
+        if invalid or not items:
+            msg = "I couldn't read these lines:\n" + "\n".join(invalid or lines)
+            msg += "\n\nUse one per line, for example:\n9876543210 Suspect\n123456789012345 Witness"
+            await update.message.reply_text(msg)
+            return RELATION
 
     existing_items = list(context.user_data.get("items", []))
-    items = existing_items + items
+    existing_numbers = {str(x.get("number", "")) for x in existing_items}
+    for item in items:
+        if str(item.get("number", "")) not in existing_numbers:
+            existing_items.append(item)
+            existing_numbers.add(str(item.get("number", "")))
+    items = existing_items
     context.user_data["items"] = items
     context.user_data["number"] = items[0]["number"]
     context.user_data["relation"] = items[0]["relation"]
@@ -478,6 +511,7 @@ async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if tracking_id:
         context.user_data["tracking_id"] = tracking_id
+        _safe_mark_used_drafts(context.user_data.get("items", []), tracking_id)
     tracking_line = f"\nTracking ID: {tracking_id}" if tracking_id else "\nTracking: unavailable"
     await update.message.reply_document(
         document=pdf,
@@ -528,14 +562,16 @@ async def bank_request_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["request_type"] = "account"
         await update.message.reply_text(
             "Send all account number(s) in ONE message.\n"
-            "Use spaces, commas, or new lines between numbers."
+            "Use spaces, commas, or new lines between numbers.\n"
+            "Or type DRAFTS to use saved Bank Account drafts."
         )
         return BANK_IDENTIFIERS
     if text in ("mobile", "m", "phone", "phone number"):
         context.user_data["request_type"] = "mobile"
         await update.message.reply_text(
             "Send all 10-digit mobile number(s) in ONE message.\n"
-            "Use spaces, commas, or new lines between numbers."
+            "Use spaces, commas, or new lines between numbers.\n"
+            "Or type DRAFTS to use saved Bank Mobile drafts."
         )
         return BANK_IDENTIFIERS
 
@@ -563,7 +599,35 @@ def _parse_bank_identifiers(text, request_type):
 
 async def bank_identifiers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     request_type = context.user_data.get("request_type", "account")
-    valid, invalid = _parse_bank_identifiers(update.message.text, request_type)
+    raw_text = update.message.text.strip()
+    draft_map = {}
+    if raw_text.upper() == "DRAFTS":
+        expected_type = "Mobile" if request_type == "mobile" else "Account"
+        try:
+            drafts = _open_drafts_for_user(
+                getattr(update.effective_user, "id", ""),
+                purpose="BANK",
+                identifier_type=expected_type,
+            )
+        except Exception as exc:
+            logging.exception("Could not load Bank drafts")
+            await update.message.reply_text(f"Could not load drafts: {exc}")
+            return BANK_IDENTIFIERS
+        if not drafts:
+            example = (
+                "/draftadd bank mobile 9876543210 Linked number"
+                if request_type == "mobile"
+                else "/draftadd bank account 123456789012 Bank account"
+            )
+            await update.message.reply_text(
+                f"No open Bank {expected_type} drafts found.\nAdd one with {example}"
+            )
+            return BANK_IDENTIFIERS
+        valid = [d.get("Identifier", "") for d in drafts if d.get("Identifier")]
+        invalid = []
+        draft_map = {d.get("Identifier", ""): d.get("Draft ID", "") for d in drafts}
+    else:
+        valid, invalid = _parse_bank_identifiers(raw_text, request_type)
     if invalid or not valid:
         label = "10-digit mobile numbers" if request_type == "mobile" else "numeric account numbers"
         msg = "Invalid value(s): " + ", ".join(invalid or [update.message.text.strip()])
@@ -575,7 +639,10 @@ async def bank_identifiers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing_numbers = {item["number"] for item in existing}
     for number in valid:
         if number not in existing_numbers:
-            existing.append({"number": number})
+            item = {"number": number}
+            if draft_map.get(number):
+                item["_draft_id"] = draft_map[number]
+            existing.append(item)
             existing_numbers.add(number)
     context.user_data["items"] = existing
 
@@ -589,6 +656,7 @@ async def bank_identifiers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if tracking_id:
             context.user_data["tracking_id"] = tracking_id
+            _safe_mark_used_drafts(context.user_data.get("items", []), tracking_id)
         await update.message.reply_document(
             document=pdf,
             filename=name,
@@ -652,6 +720,7 @@ async def bank_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if tracking_id:
         context.user_data["tracking_id"] = tracking_id
+        _safe_mark_used_drafts(context.user_data.get("items", []), tracking_id)
     tracking_line = f"\nTracking ID: {tracking_id}" if tracking_id else "\nTracking: unavailable"
     await update.message.reply_document(
         document=pdf,
@@ -1029,6 +1098,275 @@ def _sheet_service():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+
+# ---------------------------------------------------------------------------
+# Number drafts (persistent Google Sheets inbox)
+# ---------------------------------------------------------------------------
+DRAFT_SHEET_NAME = "Number Drafts"
+DRAFT_HEADERS = [
+    "Draft ID", "Added At", "Purpose", "Identifier Type", "Identifier",
+    "Note / Relation", "Status", "Used In Request", "Used At",
+    "Telegram User ID"
+]
+
+def _draft_sheet_range(a1):
+    return f"'{DRAFT_SHEET_NAME}'!{a1}"
+
+def _ensure_draft_sheet():
+    if not MYCASES_SHEET_ID:
+        raise RuntimeError("GOOGLE_SHEET_ID is not configured")
+    service = _sheet_service()
+    meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+    target = next(
+        (s for s in meta.get("sheets", [])
+         if s.get("properties", {}).get("title") == DRAFT_SHEET_NAME),
+        None
+    )
+    if not target:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": DRAFT_SHEET_NAME}}}]}
+        ).execute()
+    header = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_draft_sheet_range("A1:J1")
+    ).execute().get("values", [])
+    if not header or header[0] != DRAFT_HEADERS:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_draft_sheet_range("A1:J1"),
+            valueInputOption="RAW",
+            body={"values": [DRAFT_HEADERS]}
+        ).execute()
+    return service
+
+def _read_draft_rows():
+    service = _ensure_draft_sheet()
+    rows = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_draft_sheet_range("A2:J")
+    ).execute().get("values", [])
+    result = []
+    for row_number, row in enumerate(rows, start=2):
+        padded = list(row) + [""] * (len(DRAFT_HEADERS) - len(row))
+        result.append((row_number, dict(zip(DRAFT_HEADERS, padded[:len(DRAFT_HEADERS)]))))
+    return result
+
+def _next_draft_id(rows=None):
+    rows = rows if rows is not None else _read_draft_rows()
+    year = _ist_now().year
+    prefix = f"DRAFT-{year}-"
+    highest = 0
+    for _, row in rows:
+        value = str(row.get("Draft ID", ""))
+        if value.startswith(prefix):
+            try:
+                highest = max(highest, int(value[len(prefix):]))
+            except ValueError:
+                pass
+    return f"{prefix}{highest + 1:04d}"
+
+def _add_number_draft(purpose, identifier_type, value, note, telegram_user_id):
+    service = _ensure_draft_sheet()
+    rows = _read_draft_rows()
+    for _, row in rows:
+        if (
+            str(row.get("Telegram User ID", "")) == str(telegram_user_id)
+            and row.get("Status") == "Open"
+            and row.get("Purpose") == purpose
+            and row.get("Identifier Type") == identifier_type
+            and row.get("Identifier") == value
+        ):
+            return row.get("Draft ID"), False
+    draft_id = _next_draft_id(rows)
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    service.spreadsheets().values().append(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_draft_sheet_range("A:J"),
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[
+            draft_id, now, purpose, identifier_type, value, note or "",
+            "Open", "", "", str(telegram_user_id or "")
+        ]]}
+    ).execute()
+    return draft_id, True
+
+def _open_drafts_for_user(telegram_user_id, purpose=None, identifier_type=None):
+    rows = []
+    for _, row in _read_draft_rows():
+        if str(row.get("Telegram User ID", "")) != str(telegram_user_id):
+            continue
+        if row.get("Status") != "Open":
+            continue
+        if purpose and row.get("Purpose") != purpose:
+            continue
+        if identifier_type and row.get("Identifier Type") != identifier_type:
+            continue
+        rows.append(row)
+    return rows
+
+def _mark_drafts_used(items, request_id):
+    draft_ids = {
+        str(item.get("_draft_id", "")).strip()
+        for item in items
+        if str(item.get("_draft_id", "")).strip()
+    }
+    if not draft_ids:
+        return
+    service = _ensure_draft_sheet()
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    for row_number, row in _read_draft_rows():
+        if row.get("Draft ID") not in draft_ids:
+            continue
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_draft_sheet_range(f"G{row_number}:I{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": [["Used", request_id, now]]}
+        ).execute()
+
+def _safe_mark_used_drafts(items, request_id):
+    try:
+        _mark_drafts_used(items, request_id)
+    except Exception:
+        logging.exception("Could not mark Number Drafts as used")
+
+def _delete_number_draft(draft_id, telegram_user_id):
+    service = _ensure_draft_sheet()
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    for row_number, row in _read_draft_rows():
+        if row.get("Draft ID") != draft_id:
+            continue
+        if str(row.get("Telegram User ID", "")) != str(telegram_user_id):
+            return False
+        if row.get("Status") != "Open":
+            return False
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_draft_sheet_range(f"G{row_number}:I{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": [["Deleted", "", now]]}
+        ).execute()
+        return True
+    return False
+
+async def draft_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = list(context.args)
+    if not args:
+        await update.message.reply_text(
+            "Save numbers for later:\\n"
+            "/draftadd cdr 9876543210 Suspect\\n"
+            "/draftadd bank account 123456789012 HDFC account\\n"
+            "/draftadd bank mobile 9876543210 Linked number"
+        )
+        return
+
+    mode = args.pop(0).lower()
+    purpose = ""
+    identifier_type = ""
+    value = ""
+
+    if mode == "cdr":
+        if not args:
+            await update.message.reply_text("Use /draftadd cdr <mobile/IMEI> [relation]")
+            return
+        value = args.pop(0)
+        detected, cleaned = identifier(value)
+        if not detected:
+            await update.message.reply_text("CDR drafts must be a 10-digit mobile or 15-digit IMEI.")
+            return
+        purpose = "CDR"
+        identifier_type = detected
+        value = cleaned
+    elif mode == "bank":
+        if len(args) < 2:
+            await update.message.reply_text(
+                "Use /draftadd bank account <number> [note]\\n"
+                "or /draftadd bank mobile <10-digit number> [note]"
+            )
+            return
+        bank_kind = args.pop(0).lower()
+        value = args.pop(0)
+        purpose = "BANK"
+        if bank_kind in ("mobile", "phone"):
+            if not re.fullmatch(r"\\d{10}", value):
+                await update.message.reply_text("Bank mobile drafts must be exactly 10 digits.")
+                return
+            identifier_type = "Mobile"
+        elif bank_kind in ("account", "acc", "a/c"):
+            if not re.fullmatch(r"\\d{6,30}", value):
+                await update.message.reply_text("Bank account drafts must be 6 to 30 digits.")
+                return
+            identifier_type = "Account"
+        else:
+            await update.message.reply_text("After BANK type ACCOUNT or MOBILE.")
+            return
+    else:
+        await update.message.reply_text("First choose CDR or BANK.")
+        return
+
+    note = " ".join(args).strip()
+    try:
+        draft_id, created = _add_number_draft(
+            purpose, identifier_type, value, note,
+            getattr(update.effective_user, "id", "")
+        )
+        if created:
+            await update.message.reply_text(
+                f"💾 Saved as draft: {draft_id}\\n"
+                f"{purpose} · {identifier_type}: {value}"
+                + (f"\\nNote: {note}" if note else "")
+                + "\\n\\nUse /drafts to view saved drafts."
+            )
+        else:
+            await update.message.reply_text(
+                f"This number is already an open draft: {draft_id}"
+            )
+    except Exception as exc:
+        logging.exception("Draft add failed")
+        await update.message.reply_text(f"Could not save the draft: {exc}")
+
+async def drafts_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        rows = _open_drafts_for_user(getattr(update.effective_user, "id", ""))
+        if not rows:
+            await update.message.reply_text("No open number drafts.")
+            return
+        lines = ["💾 Open Number Drafts", ""]
+        for row in rows[:30]:
+            note = row.get("Note / Relation", "")
+            lines.append(
+                f"{row.get('Draft ID')} · {row.get('Purpose')} {row.get('Identifier Type')}\\n"
+                f"{row.get('Identifier')}"
+                + (f" — {note}" if note else "")
+            )
+        if len(rows) > 30:
+            lines.append(f"\\nShowing 30 of {len(rows)} drafts.")
+        lines.append("\\nWhile entering request numbers, type DRAFTS to use matching drafts.")
+        await update.message.reply_text("\\n\\n".join(lines))
+    except Exception as exc:
+        logging.exception("Draft list failed")
+        await update.message.reply_text(f"Could not read drafts: {exc}")
+
+async def draft_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Use /draftdelete DRAFT-2026-0001")
+        return
+    draft_id = context.args[0].strip().upper()
+    try:
+        deleted = _delete_number_draft(
+            draft_id, getattr(update.effective_user, "id", "")
+        )
+        if deleted:
+            await update.message.reply_text(f"🗑 {draft_id} removed from open drafts.")
+        else:
+            await update.message.reply_text("Draft not found, already used, or not yours.")
+    except Exception as exc:
+        logging.exception("Draft delete failed")
+        await update.message.reply_text(f"Could not delete draft: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -2551,6 +2889,9 @@ def main():
     app.add_handler(CallbackQueryHandler(request_items_callback, pattern=r"^items\|"))
     app.add_handler(CallbackQueryHandler(item_status_callback, pattern=r"^item\|"))
     app.add_handler(CommandHandler("overdue", overdue_now))
+    app.add_handler(CommandHandler("draftadd", draft_add))
+    app.add_handler(CommandHandler("drafts", drafts_list))
+    app.add_handler(CommandHandler("draftdelete", draft_delete))
     app.add_handler(CommandHandler("cancel", cancel))
 
     if app.job_queue:
