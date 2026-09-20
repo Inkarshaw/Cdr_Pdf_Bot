@@ -979,10 +979,38 @@ def _clean_case(data, existing=None):
     item["updatedAt"] = now
     return item
 
-def _read_cases():
+def _ensure_sheet():
     if not MYCASES_SHEET_ID:
         raise RuntimeError("GOOGLE_SHEET_ID is not configured")
     service = _sheet_service()
+    meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+    sheets = meta.get("sheets", [])
+    target = next((s for s in sheets if s.get("properties", {}).get("title") == MYCASES_SHEET_NAME), None)
+    if not target:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests":[{"addSheet":{"properties":{"title":MYCASES_SHEET_NAME}}}]}
+        ).execute()
+    header_range = f"{MYCASES_SHEET_NAME}!A1:X1"
+    header = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID, range=header_range
+    ).execute().get("values", [])
+    expected = [
+        "Case ID","Police Station / Unit","Case Type","Crime / CSR / UDR No.","Year",
+        "Sections / Offences","Complainant","Accused / Suspect","Investigating Officer",
+        "Priority","Court","Court Case No.","Stage","Next Hearing / Action Date","Next Action",
+        "Notes","Created At","Updated At","Accused JSON","Investigation JSON","Tasks JSON",
+        "Court Hearings JSON","Timeline JSON","Attachments JSON"
+    ]
+    if not header or header[0] != expected:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID, range=header_range,
+            valueInputOption="RAW", body={"values":[expected]}
+        ).execute()
+    return service
+
+def _read_cases():
+    service = _ensure_sheet()
     result = service.spreadsheets().values().get(
         spreadsheetId=MYCASES_SHEET_ID,
         range=f"{MYCASES_SHEET_NAME}!A2:X"
@@ -1038,7 +1066,7 @@ def mycases_create():
         return denied
     try:
         item = _clean_case(request.get_json(silent=True) or {})
-        service = _sheet_service()
+        service = _ensure_sheet()
         service.spreadsheets().values().append(
             spreadsheetId=MYCASES_SHEET_ID,
             range=f"{MYCASES_SHEET_NAME}!A:X",
