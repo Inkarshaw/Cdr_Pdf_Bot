@@ -305,7 +305,8 @@ async def bank_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return STATION_STEP
 
 async def flow_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
+    raw_text = update.message.text.strip()
+    text = raw_text.lower()
     if text in ("cdr", "call", "call details"):
         context.user_data["flow"] = "cdr"
         await update.message.reply_text("Enter Police Station code (example: G7):")
@@ -315,21 +316,53 @@ async def flow_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Enter Police Station code (example: G7):")
         return STATION_STEP
 
-    kind, value = identifier(update.message.text)
-    if kind:
-        context.user_data.clear()
-        context.user_data.update(
-            flow="cdr",
-            kind=kind,
-            number=value,
-            station=STATION,
-            from_address=FROM_ADDRESS,
-            to_address=TO_ADDRESS,
-        )
-        await update.message.reply_text("Enter Crime Number with year (example: 43/2026):")
-        return CRIME
+    # After /start, a message containing only mobile numbers / IMEIs is treated
+    # as a quick draft inbox entry. Each one is saved as a CDR draft with
+    # relation "Suspect" instead of starting the CDR creation flow.
+    tokens = [x for x in re.split(r"[\\s,;]+", raw_text) if x]
+    parsed = []
+    if tokens:
+        for token in tokens:
+            kind, value = identifier(token)
+            if not kind:
+                parsed = []
+                break
+            parsed.append((kind, value))
 
-    await update.message.reply_text("Type CDR or BANK.")
+    if parsed:
+        user_id = getattr(update.effective_user, "id", "")
+        saved_ids = []
+        existing_ids = []
+        try:
+            for kind, value in parsed:
+                draft_id, created = _add_number_draft(
+                    "CDR", kind, value, "Suspect", user_id
+                )
+                if created:
+                    saved_ids.append(draft_id)
+                else:
+                    existing_ids.append(draft_id)
+        except Exception as exc:
+            logging.exception("Quick draft save after /start failed")
+            await update.message.reply_text(f"Could not save draft: {exc}")
+            return FLOW_SELECT
+
+        lines = [f"💾 Saved {len(saved_ids)} number(s) as CDR draft — Suspect."]
+        if saved_ids:
+            lines.append("Draft ID(s): " + ", ".join(saved_ids))
+        if existing_ids:
+            lines.append(
+                f"{len(existing_ids)} number(s) were already open drafts: "
+                + ", ".join(existing_ids)
+            )
+        lines.append("")
+        lines.append("Send another number to save another draft, or type CDR / BANK.")
+        await update.message.reply_text("\\n".join(lines))
+        return FLOW_SELECT
+
+    await update.message.reply_text(
+        "Type CDR or BANK, or send only 10-digit mobile / 15-digit IMEI numbers to save them as Suspect drafts."
+    )
     return FLOW_SELECT
 
 async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
