@@ -8,7 +8,7 @@ import logging
 import threading
 import uuid
 from io import BytesIO
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -1112,8 +1112,332 @@ def _cdr_tracking_keyboard(request_id):
         ],
         [
             InlineKeyboardButton("✅ Mark Received", callback_data=f"cdr|received|{request_id}")
+        ],
+        [
+            InlineKeyboardButton("📋 Item Status", callback_data=f"items|cdr|{request_id}")
         ]
     ])
+
+
+# ---------------------------------------------------------------------------
+# Per-number / per-account tracking
+# ---------------------------------------------------------------------------
+ITEM_HEADERS = [
+    "Item ID", "Request ID", "Item No.", "Crime No.", "Identifier Type",
+    "Identifier", "Context", "From Date", "To Date", "Status",
+    "Sent Date", "Received Date", "Last Updated", "Telegram User ID"
+]
+
+def _item_sheet_name(kind):
+    return "CDR Items" if kind == "cdr" else "Bank Items"
+
+def _item_sheet_range(kind, a1):
+    return f"'{_item_sheet_name(kind)}'!{a1}"
+
+def _ensure_item_sheet(kind):
+    if not MYCASES_SHEET_ID:
+        raise RuntimeError("GOOGLE_SHEET_ID is not configured")
+    service = _sheet_service()
+    sheet_name = _item_sheet_name(kind)
+    meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+    target = next(
+        (s for s in meta.get("sheets", [])
+         if s.get("properties", {}).get("title") == sheet_name),
+        None
+    )
+    if not target:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
+        ).execute()
+    header = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_item_sheet_range(kind, "A1:N1")
+    ).execute().get("values", [])
+    if not header or header[0] != ITEM_HEADERS:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_item_sheet_range(kind, "A1:N1"),
+            valueInputOption="RAW",
+            body={"values": [ITEM_HEADERS]}
+        ).execute()
+    return service
+
+def _read_item_rows(kind, request_id=None):
+    service = _ensure_item_sheet(kind)
+    rows = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_item_sheet_range(kind, "A2:N")
+    ).execute().get("values", [])
+    result = []
+    for row_number, row in enumerate(rows, start=2):
+        padded = list(row) + [""] * (len(ITEM_HEADERS) - len(row))
+        item = dict(zip(ITEM_HEADERS, padded[:len(ITEM_HEADERS)]))
+        if request_id and item.get("Request ID") != request_id:
+            continue
+        result.append((row_number, item))
+    return result
+
+def _sync_request_items(kind, data, request_id, telegram_user_id=""):
+    if not request_id:
+        return
+    service = _ensure_item_sheet(kind)
+    existing_rows = _read_item_rows(kind, request_id=request_id)
+    available = list(existing_rows)
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    current_identifiers = set()
+
+    for item_no, source in enumerate(list(data.get("items", [])), start=1):
+        identifier_value = str(source.get("number", "")).strip()
+        if not identifier_value:
+            continue
+        current_identifiers.add(identifier_value)
+
+        matched = None
+        for pos, pair in enumerate(available):
+            if pair[1].get("Identifier") == identifier_value and pair[1].get("Status") != "Removed":
+                matched = available.pop(pos)
+                break
+
+        row_number = matched[0] if matched else None
+        old = matched[1] if matched else {}
+        item_id = old.get("Item ID") or f"{request_id}-{uuid.uuid4().hex[:8]}"
+
+        if kind == "cdr":
+            id_type = identifier(identifier_value)[0] or "Identifier"
+            context_text = str(source.get("relation", "-") or "-")
+            from_date = str(source.get("from_date", data.get("from_date", "")) or "")
+            to_date = str(source.get("to_date", data.get("to_date", "")) or "")
+        else:
+            id_type = "Mobile" if data.get("request_type") == "mobile" else "Account"
+            context_text = str(data.get("bank_name", "") or "")
+            from_date = str(data.get("start_date", "") or "")
+            to_date = "Till Date"
+
+        status = old.get("Status") if old else "Pending"
+        if status == "Removed":
+            status = "Pending"
+        sent_date = old.get("Sent Date", "")
+        received_date = old.get("Received Date", "")
+
+        row = [
+            item_id, request_id, str(item_no), str(data.get("crime", "")),
+            id_type, identifier_value, context_text, from_date, to_date,
+            status or "Pending", sent_date, received_date, now,
+            str(telegram_user_id or old.get("Telegram User ID", "")),
+        ]
+
+        if row_number:
+            service.spreadsheets().values().update(
+                spreadsheetId=MYCASES_SHEET_ID,
+                range=_item_sheet_range(kind, f"A{row_number}:N{row_number}"),
+                valueInputOption="USER_ENTERED",
+                body={"values": [row]}
+            ).execute()
+        else:
+            service.spreadsheets().values().append(
+                spreadsheetId=MYCASES_SHEET_ID,
+                range=_item_sheet_range(kind, "A:N"),
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [row]}
+            ).execute()
+
+    # Items removed from an edited PDF remain in the audit trail as Removed.
+    for row_number, old in available:
+        if old.get("Identifier") in current_identifiers:
+            continue
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_item_sheet_range(kind, f"J{row_number}:M{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": [["Removed", old.get("Sent Date", ""), old.get("Received Date", ""), now]]}
+        ).execute()
+
+def _bulk_item_status(kind, request_id, status):
+    service = _ensure_item_sheet(kind)
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    for row_number, item in _read_item_rows(kind, request_id=request_id):
+        if item.get("Status") == "Removed":
+            continue
+        current = item.get("Status") or "Pending"
+        sent_date = item.get("Sent Date", "")
+        received_date = item.get("Received Date", "")
+        new_status = current
+
+        if status == "Sent":
+            if current not in ("Received",):
+                new_status = "Sent"
+                if not sent_date:
+                    sent_date = now
+        elif status == "Received":
+            new_status = "Received"
+            if not sent_date:
+                sent_date = now
+            received_date = now
+
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_item_sheet_range(kind, f"J{row_number}:M{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": [[new_status, sent_date, received_date, now]]}
+        ).execute()
+
+def _set_item_status(kind, item_id, status):
+    service = _ensure_item_sheet(kind)
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    target_request_id = None
+    updated = None
+    for row_number, item in _read_item_rows(kind):
+        if item.get("Item ID") != item_id:
+            continue
+        target_request_id = item.get("Request ID")
+        sent_date = item.get("Sent Date", "")
+        received_date = item.get("Received Date", "")
+        if status == "Received":
+            if not sent_date:
+                sent_date = now
+            received_date = now
+        elif status == "Pending":
+            received_date = ""
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_item_sheet_range(kind, f"J{row_number}:M{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": [[status, sent_date, received_date, now]]}
+        ).execute()
+        item["Status"] = status
+        item["Sent Date"] = sent_date
+        item["Received Date"] = received_date
+        item["Last Updated"] = now
+        updated = item
+        break
+
+    if target_request_id:
+        _refresh_parent_from_items(kind, target_request_id)
+    return updated
+
+def _refresh_parent_from_items(kind, request_id):
+    active = [
+        item for _, item in _read_item_rows(kind, request_id=request_id)
+        if item.get("Status") != "Removed"
+    ]
+    if not active:
+        return
+    statuses = [item.get("Status") or "Pending" for item in active]
+    if all(s == "Received" for s in statuses):
+        parent_status = "Received"
+    elif any(s == "Received" for s in statuses):
+        parent_status = "Partially Received"
+    elif any(s == "Sent" for s in statuses):
+        parent_status = "Sent"
+    else:
+        parent_status = "Pending"
+
+    if kind == "cdr":
+        _set_cdr_status(request_id, parent_status, sync_items=False)
+    else:
+        _set_bank_status(request_id, parent_status, sync_items=False)
+
+def _item_status_keyboard(kind, request_id, items):
+    rows = []
+    for item in items:
+        if item.get("Status") == "Removed":
+            continue
+        number = item.get("Identifier", "")
+        label_number = number[-6:] if len(number) > 6 else number
+        if item.get("Status") == "Received":
+            rows.append([
+                InlineKeyboardButton(
+                    f"↩ Reset {label_number}",
+                    callback_data=f"item|{kind}|pending|{item.get('Item ID')}"
+                )
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    f"✅ Received {label_number}",
+                    callback_data=f"item|{kind}|received|{item.get('Item ID')}"
+                )
+            ])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+def _format_item_status_text(kind, request_id, items):
+    active = [x for x in items if x.get("Status") != "Removed"]
+    lines = [f"📋 {request_id} — Item Status"]
+    received = sum(1 for x in active if x.get("Status") == "Received")
+    lines.append(f"{received}/{len(active)} received")
+    for item in active:
+        icon = "✅" if item.get("Status") == "Received" else ("📤" if item.get("Status") == "Sent" else "⏳")
+        context_text = item.get("Context", "")
+        suffix = f" — {context_text}" if context_text and kind == "cdr" else ""
+        lines.append(
+            f"{icon} {item.get('Item No.', '-')}. {item.get('Identifier', '-')}{suffix}"
+        )
+    return "\n".join(lines)
+
+async def request_items_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Use /items followed by a Request ID.\n"
+            "Example: /items CDR-2026-0001 or /items BANK-2026-0001"
+        )
+        return
+    request_id = context.args[0].strip().upper()
+    kind = "cdr" if request_id.startswith("CDR-") else ("bank" if request_id.startswith("BANK-") else None)
+    if not kind:
+        await update.message.reply_text("Request ID must start with CDR- or BANK-.")
+        return
+    try:
+        items = [x for _, x in _read_item_rows(kind, request_id=request_id)]
+        if not items:
+            await update.message.reply_text("No item records found for this request.")
+            return
+        await update.message.reply_text(
+            _format_item_status_text(kind, request_id, items),
+            reply_markup=_item_status_keyboard(kind, request_id, items),
+        )
+    except Exception as exc:
+        logging.exception("Item status list failed")
+        await update.message.reply_text(f"Could not read item status: {exc}")
+
+async def request_items_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, kind, request_id = query.data.split("|", 2)
+        items = [x for _, x in _read_item_rows(kind, request_id=request_id)]
+        if not items:
+            await query.message.reply_text("No item records found for this request.")
+            return
+        await query.message.reply_text(
+            _format_item_status_text(kind, request_id, items),
+            reply_markup=_item_status_keyboard(kind, request_id, items),
+        )
+    except Exception as exc:
+        logging.exception("Items callback failed")
+        await query.message.reply_text(f"Could not read item status: {exc}")
+
+async def item_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, kind, action, item_id = query.data.split("|", 3)
+        status = "Received" if action == "received" else "Pending"
+        item = _set_item_status(kind, item_id, status)
+        if not item:
+            await query.message.reply_text("Item record not found.")
+            return
+        request_id = item.get("Request ID")
+        items = [x for _, x in _read_item_rows(kind, request_id=request_id)]
+        await query.message.reply_text(
+            _format_item_status_text(kind, request_id, items),
+            reply_markup=_item_status_keyboard(kind, request_id, items),
+        )
+    except Exception as exc:
+        logging.exception("Item status callback failed")
+        await query.message.reply_text(f"Could not update item status: {exc}")
+
 
 def _upsert_cdr_request(data, telegram_user_id="", request_id=None):
     service = _ensure_cdr_sheet()
@@ -1183,6 +1507,7 @@ def _upsert_cdr_request(data, telegram_user_id="", request_id=None):
             insertDataOption="INSERT_ROWS",
             body={"values": [row]}
         ).execute()
+    _sync_request_items("cdr", data, request_id, telegram_user_id)
     return request_id
 
 def _safe_track_cdr(data, telegram_user_id="", request_id=None):
@@ -1192,7 +1517,7 @@ def _safe_track_cdr(data, telegram_user_id="", request_id=None):
         logging.exception("CDR request tracking failed")
         return request_id
 
-def _set_cdr_status(request_id, status):
+def _set_cdr_status(request_id, status, sync_items=True):
     service = _ensure_cdr_sheet()
     rows = _read_cdr_rows()
     now = _ist_now().strftime("%d/%m/%Y %H:%M")
@@ -1218,6 +1543,8 @@ def _set_cdr_status(request_id, status):
         row["Sent Date"] = sent_date
         row["Received Date"] = received_date
         row["Last Updated"] = now
+        if sync_items and status in ("Sent", "Received"):
+            _bulk_item_status("cdr", request_id, status)
         return row
     return None
 
@@ -1452,6 +1779,9 @@ def _bank_tracking_keyboard(request_id):
         ],
         [
             InlineKeyboardButton("✅ Mark Received", callback_data=f"bank|received|{request_id}")
+        ],
+        [
+            InlineKeyboardButton("📋 Item Status", callback_data=f"items|bank|{request_id}")
         ]
     ])
 
@@ -1515,6 +1845,7 @@ def _upsert_bank_request(data, telegram_user_id="", request_id=None):
             insertDataOption="INSERT_ROWS",
             body={"values": [row]}
         ).execute()
+    _sync_request_items("bank", data, request_id, telegram_user_id)
     return request_id
 
 def _safe_track_bank(data, telegram_user_id="", request_id=None):
@@ -1524,7 +1855,7 @@ def _safe_track_bank(data, telegram_user_id="", request_id=None):
         logging.exception("Bank request tracking failed")
         return request_id
 
-def _set_bank_status(request_id, status):
+def _set_bank_status(request_id, status, sync_items=True):
     service = _ensure_bank_tracking_sheet()
     rows = _read_bank_tracking_rows()
     now = _ist_now().strftime("%d/%m/%Y %H:%M")
@@ -1549,6 +1880,8 @@ def _set_bank_status(request_id, status):
         row["Sent Date"] = sent_date
         row["Received Date"] = received_date
         row["Last Updated"] = now
+        if sync_items and status in ("Sent", "Received"):
+            _bulk_item_status("bank", request_id, status)
         return row
     return None
 
@@ -1708,6 +2041,94 @@ async def bank_status_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(f"Could not update the Bank tracker: {exc}")
 
 
+
+# ---------------------------------------------------------------------------
+# Automatic overdue reminders
+# ---------------------------------------------------------------------------
+def _overdue_sent_days(row):
+    raw = row.get("Sent Date", "")
+    if not raw:
+        return 0
+    try:
+        dt = datetime.strptime(raw, "%d/%m/%Y %H:%M").replace(
+            tzinfo=timezone(timedelta(hours=5, minutes=30))
+        )
+        return max(0, (_ist_now().date() - dt.date()).days)
+    except ValueError:
+        return 0
+
+def _overdue_rows_for_user(rows, telegram_user_id):
+    result = []
+    for row in rows:
+        if str(row.get("Telegram User ID", "")) != str(telegram_user_id):
+            continue
+        if row.get("Status") == "Received":
+            continue
+        days = _overdue_sent_days(row)
+        if days >= 3:
+            result.append((days, row))
+    return sorted(result, key=lambda x: x[0], reverse=True)
+
+def _build_overdue_message(cdr_rows, bank_rows):
+    cdr_3 = sum(1 for days, _ in cdr_rows if 3 <= days < 7)
+    cdr_7 = sum(1 for days, _ in cdr_rows if days >= 7)
+    bank_3 = sum(1 for days, _ in bank_rows if 3 <= days < 7)
+    bank_7 = sum(1 for days, _ in bank_rows if days >= 7)
+
+    lines = [
+        "⏰ Pending Request Reminder",
+        "",
+        f"CDR: {len(cdr_rows)} overdue — {cdr_7} pending 7+ days",
+        f"Bank: {len(bank_rows)} overdue — {bank_7} pending 7+ days",
+    ]
+    top = [("CDR", x) for x in cdr_rows] + [("BANK", x) for x in bank_rows]
+    top.sort(key=lambda x: x[1][0], reverse=True)
+    if top:
+        lines.append("")
+        lines.append("Oldest pending:")
+        for kind, (days, row) in top[:8]:
+            lines.append(
+                f"• {row.get('Request ID', '-')} | Cr.No. {row.get('Crime No.', '-')} | {days} days"
+            )
+    lines.append("")
+    lines.append("Use /pending or /bankpending for the full lists.")
+    return "\n".join(lines)
+
+async def overdue_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        cdr_all = [row for _, row in _read_cdr_rows()]
+        bank_all = [row for _, row in _read_bank_tracking_rows()]
+        user_ids = {
+            str(r.get("Telegram User ID", ""))
+            for r in cdr_all + bank_all
+            if str(r.get("Telegram User ID", "")).strip()
+        }
+        for user_id in user_ids:
+            cdr_rows = _overdue_rows_for_user(cdr_all, user_id)
+            bank_rows = _overdue_rows_for_user(bank_all, user_id)
+            if not cdr_rows and not bank_rows:
+                continue
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=_build_overdue_message(cdr_rows, bank_rows)
+            )
+    except Exception:
+        logging.exception("Automatic overdue reminder failed")
+
+async def overdue_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = str(getattr(update.effective_user, "id", ""))
+        cdr_rows = _overdue_rows_for_user([r for _, r in _read_cdr_rows()], user_id)
+        bank_rows = _overdue_rows_for_user([r for _, r in _read_bank_tracking_rows()], user_id)
+        if not cdr_rows and not bank_rows:
+            await update.message.reply_text("No sent requests are overdue by 3 or more days.")
+            return
+        await update.message.reply_text(_build_overdue_message(cdr_rows, bank_rows))
+    except Exception as exc:
+        logging.exception("Overdue summary failed")
+        await update.message.reply_text(f"Could not build overdue summary: {exc}")
+
+
 def _row_to_case(row):
     padded = list(row) + [""] * (len(MYCASES_FIELDS) - len(row))
     item = {}
@@ -1779,6 +2200,95 @@ def _ensure_sheet():
         ).execute()
     return service
 
+
+def _case_crime_reference(case):
+    crime_no = str(case.get("crimeNo", "") or "").strip()
+    crime_year = str(case.get("crimeYear", "") or "").strip()
+    if not crime_no:
+        return ""
+    if "/" in crime_no:
+        return crime_no
+    return f"{crime_no}/{crime_year}" if crime_year else crime_no
+
+def _attach_requests_to_cases(cases):
+    try:
+        cdr_rows = [row for _, row in _read_cdr_rows()]
+        bank_rows = [row for _, row in _read_bank_tracking_rows()]
+        cdr_items = [row for _, row in _read_item_rows("cdr")]
+        bank_items = [row for _, row in _read_item_rows("bank")]
+    except Exception:
+        logging.exception("Could not attach request trackers to My Cases")
+        return cases
+
+    cdr_items_by_request = {}
+    bank_items_by_request = {}
+    for item in cdr_items:
+        cdr_items_by_request.setdefault(item.get("Request ID", ""), []).append(item)
+    for item in bank_items:
+        bank_items_by_request.setdefault(item.get("Request ID", ""), []).append(item)
+
+    for case in cases:
+        ref = _case_crime_reference(case)
+        cdr = []
+        bank = []
+        if ref:
+            for row in cdr_rows:
+                if str(row.get("Crime No.", "")).strip() != ref:
+                    continue
+                rid = row.get("Request ID", "")
+                cdr.append({
+                    "requestId": rid,
+                    "status": row.get("Status", "Pending"),
+                    "generatedAt": row.get("Generated At", ""),
+                    "sentDate": row.get("Sent Date", ""),
+                    "receivedDate": row.get("Received Date", ""),
+                    "numbers": row.get("Mobile / IMEI", ""),
+                    "pendingDays": _cdr_pending_days(row),
+                    "items": [
+                        {
+                            "itemId": x.get("Item ID", ""),
+                            "number": x.get("Identifier", ""),
+                            "status": x.get("Status", "Pending"),
+                            "relation": x.get("Context", ""),
+                        }
+                        for x in cdr_items_by_request.get(rid, [])
+                        if x.get("Status") != "Removed"
+                    ],
+                })
+            for row in bank_rows:
+                if str(row.get("Crime No.", "")).strip() != ref:
+                    continue
+                rid = row.get("Request ID", "")
+                bank.append({
+                    "requestId": rid,
+                    "status": row.get("Status", "Pending"),
+                    "generatedAt": row.get("Generated At", ""),
+                    "sentDate": row.get("Sent Date", ""),
+                    "receivedDate": row.get("Received Date", ""),
+                    "bankName": row.get("Bank Name", ""),
+                    "requestType": row.get("Request Type", ""),
+                    "numbers": row.get("Account / Mobile Numbers", ""),
+                    "pendingDays": _bank_pending_days(row),
+                    "items": [
+                        {
+                            "itemId": x.get("Item ID", ""),
+                            "number": x.get("Identifier", ""),
+                            "status": x.get("Status", "Pending"),
+                        }
+                        for x in bank_items_by_request.get(rid, [])
+                        if x.get("Status") != "Removed"
+                    ],
+                })
+
+        case["requests"] = {
+            "cdr": cdr,
+            "bank": bank,
+            "pendingCount": sum(1 for x in cdr + bank if x.get("status") != "Received"),
+            "receivedCount": sum(1 for x in cdr + bank if x.get("status") == "Received"),
+        }
+    return cases
+
+
 def _read_cases():
     service = _ensure_sheet()
     result = service.spreadsheets().values().get(
@@ -1786,7 +2296,8 @@ def _read_cases():
         range=f"{MYCASES_SHEET_NAME}!A2:AA"
     ).execute()
     rows = result.get("values", [])
-    return [_row_to_case(row) for row in rows if any(str(v).strip() for v in row)]
+    cases = [_row_to_case(row) for row in rows if any(str(v).strip() for v in row)]
+    return _attach_requests_to_cases(cases)
 
 def _find_case(case_id):
     cases = _read_cases()
@@ -1969,7 +2480,20 @@ def main():
     app.add_handler(CommandHandler("bankmarkreceived", bank_mark_received))
     app.add_handler(CommandHandler("bankmarksent", bank_mark_sent))
     app.add_handler(CallbackQueryHandler(bank_status_callback, pattern=r"^bank\|"))
+    app.add_handler(CommandHandler("items", request_items_command))
+    app.add_handler(CallbackQueryHandler(request_items_callback, pattern=r"^items\|"))
+    app.add_handler(CallbackQueryHandler(item_status_callback, pattern=r"^item\|"))
+    app.add_handler(CommandHandler("overdue", overdue_now))
     app.add_handler(CommandHandler("cancel", cancel))
+
+    if app.job_queue:
+        ist = timezone(timedelta(hours=5, minutes=30))
+        app.job_queue.run_daily(
+            overdue_reminder_job,
+            time=dt_time(hour=9, minute=0, tzinfo=ist),
+            name="daily-overdue-reminder",
+        )
+
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
