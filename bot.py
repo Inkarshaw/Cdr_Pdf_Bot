@@ -863,8 +863,12 @@ MYCASES_FIELDS = [
     "id", "policeStation", "caseType", "crimeNo", "crimeYear",
     "sections", "complainant", "accused", "ioName", "priority",
     "court", "courtCaseNo", "stage", "nextHearing", "nextAction",
-    "notes", "createdAt", "updatedAt"
+    "notes", "createdAt", "updatedAt", "accusedPersons", "investigationChecklist",
+    "tasks", "hearings", "timeline", "attachments"
 ]
+MYCASES_JSON_FIELDS = {
+    "accusedPersons", "investigationChecklist", "tasks", "hearings", "timeline", "attachments"
+}
 
 api_app = Flask("clearexams_mycases_api")
 CORS(
@@ -936,10 +940,27 @@ def _sheet_service():
 
 def _row_to_case(row):
     padded = list(row) + [""] * (len(MYCASES_FIELDS) - len(row))
-    return {key: padded[i] if i < len(padded) else "" for i, key in enumerate(MYCASES_FIELDS)}
+    item = {}
+    for i, key in enumerate(MYCASES_FIELDS):
+        value = padded[i] if i < len(padded) else ""
+        if key in MYCASES_JSON_FIELDS:
+            try:
+                item[key] = json.loads(value) if value else []
+            except Exception:
+                item[key] = []
+        else:
+            item[key] = value
+    return item
 
 def _case_to_row(item):
-    return [str(item.get(key, "") or "") for key in MYCASES_FIELDS]
+    row = []
+    for key in MYCASES_FIELDS:
+        value = item.get(key, "")
+        if key in MYCASES_JSON_FIELDS:
+            row.append(json.dumps(value if isinstance(value, list) else [], separators=(",", ":")))
+        else:
+            row.append(str(value or ""))
+    return row
 
 def _clean_case(data, existing=None):
     existing = existing or {}
@@ -949,7 +970,10 @@ def _clean_case(data, existing=None):
         if key in ("createdAt", "updatedAt"):
             continue
         value = data.get(key, "") if isinstance(data, dict) else ""
-        item[key] = str(value).strip() if value is not None else ""
+        if key in MYCASES_JSON_FIELDS:
+            item[key] = value if isinstance(value, list) else []
+        else:
+            item[key] = str(value).strip() if value is not None else ""
     item["id"] = item.get("id") or existing.get("id") or f"case_{uuid.uuid4().hex}"
     item["createdAt"] = existing.get("createdAt") or str(data.get("createdAt", "") or "") or now
     item["updatedAt"] = now
@@ -961,7 +985,7 @@ def _read_cases():
     service = _sheet_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=MYCASES_SHEET_ID,
-        range=f"{MYCASES_SHEET_NAME}!A2:R"
+        range=f"{MYCASES_SHEET_NAME}!A2:X"
     ).execute()
     rows = result.get("values", [])
     return [_row_to_case(row) for row in rows if any(str(v).strip() for v in row)]
@@ -1017,7 +1041,7 @@ def mycases_create():
         service = _sheet_service()
         service.spreadsheets().values().append(
             spreadsheetId=MYCASES_SHEET_ID,
-            range=f"{MYCASES_SHEET_NAME}!A:R",
+            range=f"{MYCASES_SHEET_NAME}!A:X",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [_case_to_row(item)]}
@@ -1042,7 +1066,7 @@ def mycases_update(case_id):
         service = _sheet_service()
         service.spreadsheets().values().update(
             spreadsheetId=MYCASES_SHEET_ID,
-            range=f"{MYCASES_SHEET_NAME}!A{row_number}:R{row_number}",
+            range=f"{MYCASES_SHEET_NAME}!A{row_number}:X{row_number}",
             valueInputOption="USER_ENTERED",
             body={"values": [_case_to_row(item)]}
         ).execute()
