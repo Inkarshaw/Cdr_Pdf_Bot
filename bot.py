@@ -2830,6 +2830,68 @@ def start_mycases_api():
     api_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🤖 CDR / BANK REQUEST BOT — HELP\n\n"
+        "📄 CREATE REQUESTS\n"
+        "/start — Choose CDR or BANK\n"
+        "/cdr — Start a CDR request\n"
+        "/bank — Start a Bank request\n"
+        "/add — Add number/account to the last request\n"
+        "/change — Change a number/account in the last request\n"
+        "/remove — Remove a number/account from the last request\n"
+        "/cancel — Cancel the current flow\n\n"
+
+        "📱 CDR TRACKING\n"
+        "/pending — Pending CDR requests\n"
+        "/received — Recently received CDR requests\n"
+        "/search <term> — Search CDR requests\n"
+        "/marksent <CDR-ID> — Mark CDR request Sent\n"
+        "/markreceived <CDR-ID> — Mark CDR request Received\n"
+        "/items <CDR-ID> — View/mark individual CDR numbers\n\n"
+
+        "🏦 BANK TRACKING\n"
+        "/bankpending — Pending Bank requests\n"
+        "/bankreceived — Recently received Bank requests\n"
+        "/banksearch <term> — Search Bank requests\n"
+        "/bankmarksent <BANK-ID> — Mark Bank request Sent\n"
+        "/bankmarkreceived <BANK-ID> — Mark Bank request Received\n"
+        "/items <BANK-ID> — View/mark individual bank numbers/accounts\n\n"
+
+        "💾 DRAFT NUMBERS\n"
+        "/draftadd cdr <number> [relation] — Save CDR mobile/IMEI\n"
+        "/draftadd bank account <number> [note] — Save bank account\n"
+        "/draftadd bank mobile <number> [note] — Save bank mobile\n"
+        "/drafts — View open drafts\n"
+        "/draftdelete <DRAFT-ID> — Delete an unused draft\n\n"
+
+        "⏰ REMINDERS\n"
+        "/overdue — Show requests sent 3+ days ago and still pending\n\n"
+
+        "⌨️ FLOW KEYWORDS\n"
+        "CDR — Start CDR flow\n"
+        "BANK — Start Bank flow\n"
+        "ACCOUNT — Bank request by account number\n"
+        "MOBILE — Bank request by mobile number\n"
+        "DRAFTS — Use matching saved draft numbers\n"
+        "TILL / TILL DATE / TODAY — Use Till Date as CDR end date\n"
+        "DEFAULT — Use saved default email where available\n"
+        "YES / Y — Add another number in add-more flow\n"
+        "NO / N / DONE — Finish and generate PDF\n\n"
+
+        "🏢 STATION SHORT CODES\n"
+        "G7 — G7 Chetpet PS (L&O)\n"
+        "G5 — G5 Secretariat Colony PS\n"
+        "G3 — G3 Kilpauk PS (L&O)\n\n"
+
+        "Examples:\n"
+        "/search 43/2026\n"
+        "/banksearch 9876543210\n"
+        "/items CDR-2026-0001\n"
+        "/draftadd cdr 9876543210 Suspect"
+    )
+    await update.message.reply_text(text)
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelled. Send /start to begin again.")
@@ -2889,6 +2951,7 @@ def main():
     app.add_handler(CallbackQueryHandler(request_items_callback, pattern=r"^items\|"))
     app.add_handler(CallbackQueryHandler(item_status_callback, pattern=r"^item\|"))
     app.add_handler(CommandHandler("overdue", overdue_now))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("draftadd", draft_add))
     app.add_handler(CommandHandler("drafts", drafts_list))
     app.add_handler(CommandHandler("draftdelete", draft_delete))
