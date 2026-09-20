@@ -582,10 +582,21 @@ async def bank_identifiers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("bank_adding") and context.user_data.get("start_date") and context.user_data.get("email"):
         pdf = build_bank_pdf(context.user_data)
         name = f"Bank_Request_{context.user_data['crime'].replace('/', '_')}.pdf"
+        tracking_id = _safe_track_bank(
+            context.user_data,
+            telegram_user_id=getattr(update.effective_user, "id", ""),
+            request_id=context.user_data.get("tracking_id"),
+        )
+        if tracking_id:
+            context.user_data["tracking_id"] = tracking_id
         await update.message.reply_document(
             document=pdf,
             filename=name,
-            caption=f"Updated Bank Request PDF generated with {len(existing)} number(s).",
+            caption=(
+                f"Updated Bank Request PDF generated with {len(existing)} number(s)."
+                + (f"\nTracking ID: {tracking_id}" if tracking_id else "")
+            ),
+            reply_markup=_bank_tracking_keyboard(tracking_id),
         )
         saved = dict(context.user_data)
         saved["items"] = list(existing)
@@ -634,13 +645,22 @@ async def bank_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pdf = build_bank_pdf(context.user_data)
     name = f"Bank_Request_{context.user_data['crime'].replace('/', '_')}.pdf"
+    tracking_id = _safe_track_bank(
+        context.user_data,
+        telegram_user_id=getattr(update.effective_user, "id", ""),
+        request_id=context.user_data.get("tracking_id"),
+    )
+    if tracking_id:
+        context.user_data["tracking_id"] = tracking_id
+    tracking_line = f"\nTracking ID: {tracking_id}" if tracking_id else "\nTracking: unavailable"
     await update.message.reply_document(
         document=pdf,
         filename=name,
         caption=(
-            f"Bank Request PDF generated with {len(context.user_data.get('items', []))} number(s). "
-            "Use /add, /change, or /remove to edit the last request."
+            f"Bank Request PDF generated with {len(context.user_data.get('items', []))} number(s)."
+            f"{tracking_line}\nUse /add, /change, or /remove to edit the last request."
         ),
+        reply_markup=_bank_tracking_keyboard(tracking_id),
     )
 
     saved = dict(context.user_data)
@@ -801,6 +821,14 @@ async def change_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if request_kind == "bank":
         pdf = build_bank_pdf(saved)
         name = f"Bank_Request_{saved['crime'].replace('/', '_')}.pdf"
+        tracking_id = _safe_track_bank(
+            saved,
+            telegram_user_id=getattr(update.effective_user, "id", ""),
+            request_id=saved.get("tracking_id"),
+        )
+        if tracking_id:
+            saved["tracking_id"] = tracking_id
+            context.user_data["last_request"] = saved
     else:
         pdf_data = dict(saved)
         pdf_data["number"] = saved["items"][0]["number"]
@@ -823,9 +851,13 @@ async def change_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
         filename=name,
         caption=(
             f"Changed {old_number} to {value}. Updated PDF generated."
-            + (f"\nTracking ID: {saved.get('tracking_id')}" if request_kind == "cdr" and saved.get("tracking_id") else "")
+            + (f"\nTracking ID: {saved.get('tracking_id')}" if saved.get("tracking_id") else "")
         ),
-        reply_markup=_cdr_tracking_keyboard(saved.get("tracking_id")) if request_kind == "cdr" else None,
+        reply_markup=(
+            _cdr_tracking_keyboard(saved.get("tracking_id"))
+            if request_kind == "cdr"
+            else _bank_tracking_keyboard(saved.get("tracking_id"))
+        ),
     )
     return ConversationHandler.END
 
@@ -869,6 +901,14 @@ async def remove_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if request_kind == "bank":
         pdf = build_bank_pdf(saved)
         name = f"Bank_Request_{saved['crime'].replace('/', '_')}.pdf"
+        tracking_id = _safe_track_bank(
+            saved,
+            telegram_user_id=getattr(update.effective_user, "id", ""),
+            request_id=saved.get("tracking_id"),
+        )
+        if tracking_id:
+            saved["tracking_id"] = tracking_id
+            context.user_data["last_request"] = saved
     else:
         pdf_data = dict(saved)
         pdf_data["number"] = saved["items"][0]["number"]
@@ -890,9 +930,13 @@ async def remove_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
         filename=name,
         caption=(
             f"Removed {removed['number']}. Updated PDF generated with {len(saved['items'])} number(s)."
-            + (f"\nTracking ID: {saved.get('tracking_id')}" if request_kind == "cdr" and saved.get("tracking_id") else "")
+            + (f"\nTracking ID: {saved.get('tracking_id')}" if saved.get("tracking_id") else "")
         ),
-        reply_markup=_cdr_tracking_keyboard(saved.get("tracking_id")) if request_kind == "cdr" else None,
+        reply_markup=(
+            _cdr_tracking_keyboard(saved.get("tracking_id"))
+            if request_kind == "cdr"
+            else _bank_tracking_keyboard(saved.get("tracking_id"))
+        ),
     )
     return ConversationHandler.END
 
@@ -1326,6 +1370,344 @@ async def cdr_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text(f"Could not update the CDR tracker: {exc}")
 
 
+
+# ---------------------------------------------------------------------------
+# Bank request tracking (Google Sheets)
+# ---------------------------------------------------------------------------
+BANK_TRACKING_SHEET_NAME = "Bank Requests"
+BANK_TRACKING_HEADERS = [
+    "Request ID", "Generated At", "Police Station", "Crime No.", "Sections",
+    "Case Type", "Bank Name", "Request Type", "Account / Mobile Numbers",
+    "Statement From", "Email", "Status", "Sent Date", "Received Date",
+    "Last Updated", "Telegram User ID", "PDF Filename", "Remarks"
+]
+
+def _bank_track_sheet_range(a1):
+    return f"'{BANK_TRACKING_SHEET_NAME}'!{a1}"
+
+def _ensure_bank_tracking_sheet():
+    if not MYCASES_SHEET_ID:
+        raise RuntimeError("GOOGLE_SHEET_ID is not configured")
+    service = _sheet_service()
+    meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+    target = next(
+        (s for s in meta.get("sheets", [])
+         if s.get("properties", {}).get("title") == BANK_TRACKING_SHEET_NAME),
+        None
+    )
+    if not target:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": BANK_TRACKING_SHEET_NAME}}}]}
+        ).execute()
+
+    header = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_bank_track_sheet_range("A1:R1")
+    ).execute().get("values", [])
+    if not header or header[0] != BANK_TRACKING_HEADERS:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_bank_track_sheet_range("A1:R1"),
+            valueInputOption="RAW",
+            body={"values": [BANK_TRACKING_HEADERS]}
+        ).execute()
+    return service
+
+def _read_bank_tracking_rows():
+    service = _ensure_bank_tracking_sheet()
+    rows = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_bank_track_sheet_range("A2:R")
+    ).execute().get("values", [])
+    result = []
+    for index, row in enumerate(rows, start=2):
+        padded = list(row) + [""] * (len(BANK_TRACKING_HEADERS) - len(row))
+        result.append(
+            (index, dict(zip(BANK_TRACKING_HEADERS, padded[:len(BANK_TRACKING_HEADERS)])))
+        )
+    return result
+
+def _next_bank_request_id(rows=None):
+    rows = rows if rows is not None else _read_bank_tracking_rows()
+    year = _ist_now().year
+    prefix = f"BANK-{year}-"
+    highest = 0
+    for _, row in rows:
+        rid = str(row.get("Request ID", ""))
+        if rid.startswith(prefix):
+            try:
+                highest = max(highest, int(rid[len(prefix):]))
+            except ValueError:
+                pass
+    return f"{prefix}{highest + 1:04d}"
+
+def _bank_tracking_keyboard(request_id):
+    if not request_id:
+        return None
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 Mark Sent", callback_data=f"bank|sent|{request_id}"),
+            InlineKeyboardButton("🟠 Partial", callback_data=f"bank|partial|{request_id}"),
+        ],
+        [
+            InlineKeyboardButton("✅ Mark Received", callback_data=f"bank|received|{request_id}")
+        ]
+    ])
+
+def _upsert_bank_request(data, telegram_user_id="", request_id=None):
+    service = _ensure_bank_tracking_sheet()
+    rows = _read_bank_tracking_rows()
+    row_number = None
+    existing = {}
+    if request_id:
+        for rn, row in rows:
+            if row.get("Request ID") == request_id:
+                row_number = rn
+                existing = row
+                break
+    if not request_id:
+        request_id = _next_bank_request_id(rows)
+
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    items = list(data.get("items", []))
+    numbers = "\n".join(
+        str(item.get("number", "")) for item in items if item.get("number")
+    )
+    request_type = str(data.get("request_type", "account")).strip().lower()
+    request_type_label = "Mobile Number" if request_type == "mobile" else "Account Number"
+    crime = str(data.get("crime", ""))
+    filename = f"Bank_Request_{crime.replace('/', '_')}.pdf" if crime else "Bank_Request.pdf"
+
+    row = [
+        request_id,
+        existing.get("Generated At") or now,
+        str(data.get("station", STATION)),
+        crime,
+        str(data.get("section", "")),
+        str(data.get("case_type", "")),
+        str(data.get("bank_name", "")),
+        request_type_label,
+        numbers,
+        str(data.get("start_date", "")),
+        str(data.get("email", "")),
+        existing.get("Status") or "Pending",
+        existing.get("Sent Date") or "",
+        existing.get("Received Date") or "",
+        now,
+        str(telegram_user_id or existing.get("Telegram User ID", "")),
+        filename,
+        existing.get("Remarks") or "",
+    ]
+
+    if row_number:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_bank_track_sheet_range(f"A{row_number}:R{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": [row]}
+        ).execute()
+    else:
+        service.spreadsheets().values().append(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_bank_track_sheet_range("A:R"),
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]}
+        ).execute()
+    return request_id
+
+def _safe_track_bank(data, telegram_user_id="", request_id=None):
+    try:
+        return _upsert_bank_request(data, telegram_user_id, request_id=request_id)
+    except Exception:
+        logging.exception("Bank request tracking failed")
+        return request_id
+
+def _set_bank_status(request_id, status):
+    service = _ensure_bank_tracking_sheet()
+    rows = _read_bank_tracking_rows()
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    for row_number, row in rows:
+        if row.get("Request ID") != request_id:
+            continue
+        sent_date = row.get("Sent Date", "")
+        received_date = row.get("Received Date", "")
+        if status in ("Sent", "Partially Received") and not sent_date:
+            sent_date = now
+        if status == "Received":
+            if not sent_date:
+                sent_date = now
+            received_date = now
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_bank_track_sheet_range(f"L{row_number}:O{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": [[status, sent_date, received_date, now]]}
+        ).execute()
+        row["Status"] = status
+        row["Sent Date"] = sent_date
+        row["Received Date"] = received_date
+        row["Last Updated"] = now
+        return row
+    return None
+
+def _bank_pending_days(row):
+    if row.get("Status") == "Received":
+        return 0
+    raw = row.get("Sent Date") or row.get("Generated At")
+    if not raw:
+        return 0
+    try:
+        dt = datetime.strptime(raw, "%d/%m/%Y %H:%M").replace(
+            tzinfo=timezone(timedelta(hours=5, minutes=30))
+        )
+        return max(0, (_ist_now().date() - dt.date()).days)
+    except ValueError:
+        return 0
+
+def _format_bank_tracking_row(row):
+    numbers = row.get("Account / Mobile Numbers", "").replace("\n", ", ")
+    if len(numbers) > 120:
+        numbers = numbers[:117] + "..."
+    status = row.get("Status") or "Pending"
+    pending_text = ""
+    if status != "Received":
+        pending_text = f"\nPending: {_bank_pending_days(row)} day(s)"
+    return (
+        f"{row.get('Request ID', '-')}\n"
+        f"Cr.No: {row.get('Crime No.', '-')}\n"
+        f"Bank: {row.get('Bank Name', '-')}\n"
+        f"Type: {row.get('Request Type', '-')}\n"
+        f"Number(s): {numbers or '-'}\n"
+        f"Status: {status}{pending_text}"
+    )
+
+async def bank_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        rows = [
+            row for _, row in _read_bank_tracking_rows()
+            if (row.get("Status") or "Pending") != "Received"
+        ]
+        if not rows:
+            await update.message.reply_text("No pending Bank requests.")
+            return
+        rows.sort(key=lambda r: _bank_pending_days(r), reverse=True)
+        shown = rows[:20]
+        text = "🏦 Pending Bank Requests\n\n" + "\n\n".join(
+            _format_bank_tracking_row(r) for r in shown
+        )
+        if len(rows) > len(shown):
+            text += f"\n\nShowing 20 of {len(rows)} pending requests."
+        await update.message.reply_text(text)
+    except Exception as exc:
+        logging.exception("Pending Bank list failed")
+        await update.message.reply_text(f"Could not read the Bank tracker: {exc}")
+
+async def bank_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        rows = [
+            row for _, row in _read_bank_tracking_rows()
+            if row.get("Status") == "Received"
+        ]
+        if not rows:
+            await update.message.reply_text("No Bank requests are marked Received yet.")
+            return
+        shown = list(reversed(rows[-20:]))
+        await update.message.reply_text(
+            "✅ Recently Received Bank Requests\n\n" +
+            "\n\n".join(_format_bank_tracking_row(r) for r in shown)
+        )
+    except Exception as exc:
+        logging.exception("Received Bank list failed")
+        await update.message.reply_text(f"Could not read the Bank tracker: {exc}")
+
+async def bank_search_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    term = " ".join(context.args).strip().lower()
+    if not term:
+        await update.message.reply_text(
+            "Use /banksearch followed by a Request ID, Crime No., bank name, account number, or mobile number.\n"
+            "Example: /banksearch 43/2026"
+        )
+        return
+    try:
+        matches = []
+        for _, row in _read_bank_tracking_rows():
+            haystack = " ".join([
+                row.get("Request ID", ""),
+                row.get("Crime No.", ""),
+                row.get("Bank Name", ""),
+                row.get("Account / Mobile Numbers", ""),
+                row.get("Police Station", ""),
+            ]).lower()
+            if term in haystack:
+                matches.append(row)
+        if not matches:
+            await update.message.reply_text("No matching Bank request found.")
+            return
+        shown = matches[-15:]
+        await update.message.reply_text(
+            f"🔎 Bank Search Results ({len(matches)})\n\n" +
+            "\n\n".join(_format_bank_tracking_row(r) for r in reversed(shown))
+        )
+    except Exception as exc:
+        logging.exception("Bank search failed")
+        await update.message.reply_text(f"Could not search the Bank tracker: {exc}")
+
+async def bank_mark_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Use /bankmarkreceived BANK-2026-0001")
+        return
+    request_id = context.args[0].strip().upper()
+    try:
+        row = _set_bank_status(request_id, "Received")
+        if not row:
+            await update.message.reply_text("Bank Request ID not found.")
+            return
+        await update.message.reply_text(f"✅ {request_id} marked Received.")
+    except Exception as exc:
+        logging.exception("Bank mark received failed")
+        await update.message.reply_text(f"Could not update the Bank tracker: {exc}")
+
+async def bank_mark_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Use /bankmarksent BANK-2026-0001")
+        return
+    request_id = context.args[0].strip().upper()
+    try:
+        row = _set_bank_status(request_id, "Sent")
+        if not row:
+            await update.message.reply_text("Bank Request ID not found.")
+            return
+        await update.message.reply_text(f"📤 {request_id} marked Sent.")
+    except Exception as exc:
+        logging.exception("Bank mark sent failed")
+        await update.message.reply_text(f"Could not update the Bank tracker: {exc}")
+
+async def bank_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, action, request_id = query.data.split("|", 2)
+        status_map = {
+            "sent": "Sent",
+            "partial": "Partially Received",
+            "received": "Received",
+        }
+        status = status_map.get(action)
+        if not status:
+            return
+        row = _set_bank_status(request_id, status)
+        if not row:
+            await query.message.reply_text("Bank tracking record not found.")
+            return
+        icon = {"Sent": "📤", "Partially Received": "🟠", "Received": "✅"}[status]
+        await query.message.reply_text(f"{icon} {request_id} marked {status}.")
+    except Exception as exc:
+        logging.exception("Bank status callback failed")
+        await query.message.reply_text(f"Could not update the Bank tracker: {exc}")
+
+
 def _row_to_case(row):
     padded = list(row) + [""] * (len(MYCASES_FIELDS) - len(row))
     item = {}
@@ -1581,6 +1963,12 @@ def main():
     app.add_handler(CommandHandler("markreceived", cdr_mark_received))
     app.add_handler(CommandHandler("marksent", cdr_mark_sent))
     app.add_handler(CallbackQueryHandler(cdr_status_callback, pattern=r"^cdr\|"))
+    app.add_handler(CommandHandler("bankpending", bank_pending))
+    app.add_handler(CommandHandler("bankreceived", bank_received))
+    app.add_handler(CommandHandler("banksearch", bank_search_tracking))
+    app.add_handler(CommandHandler("bankmarkreceived", bank_mark_received))
+    app.add_handler(CommandHandler("bankmarksent", bank_mark_sent))
+    app.add_handler(CallbackQueryHandler(bank_status_callback, pattern=r"^bank\|"))
     app.add_handler(CommandHandler("cancel", cancel))
     app.run_polling(drop_pending_updates=True)
 
