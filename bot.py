@@ -1526,6 +1526,8 @@ def _set_cdr_status(request_id, status, sync_items=True):
             continue
         sent_date = row.get("Sent Date", "")
         received_date = row.get("Received Date", "")
+        if status != "Received":
+            received_date = ""
         if status in ("Sent", "Partially Received") and not sent_date:
             sent_date = now
         if status == "Received":
@@ -1864,6 +1866,8 @@ def _set_bank_status(request_id, status, sync_items=True):
             continue
         sent_date = row.get("Sent Date", "")
         received_date = row.get("Received Date", "")
+        if status != "Received":
+            received_date = ""
         if status in ("Sent", "Partially Received") and not sent_date:
             sent_date = now
         if status == "Received":
