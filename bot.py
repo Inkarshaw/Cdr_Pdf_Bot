@@ -292,16 +292,103 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return FLOW_SELECT
 
+def _parse_quick_draft_values(raw_text, purpose):
+    tokens = [x for x in re.split(r"[\s,;]+", (raw_text or "").strip()) if x]
+    if not tokens:
+        return None
+
+    parsed = []
+    if purpose == "CDR":
+        for token in tokens:
+            kind, value = identifier(token)
+            if not kind:
+                return None
+            parsed.append((kind, value))
+        return parsed
+
+    # BANK quick drafts: 10 digits are treated as mobile numbers.
+    # Other 6-30 digit numeric values are treated as account numbers.
+    for token in tokens:
+        if re.fullmatch(r"\d{10}", token):
+            parsed.append(("Mobile", token))
+        elif re.fullmatch(r"\d{6,30}", token):
+            parsed.append(("Account", token))
+        else:
+            return None
+    return parsed
+
+
+async def _save_quick_drafts(update, purpose, raw_text):
+    parsed = _parse_quick_draft_values(raw_text, purpose)
+    if not parsed:
+        return False
+
+    user_id = getattr(update.effective_user, "id", "")
+    saved_ids = []
+    existing_ids = []
+
+    try:
+        for kind, value in parsed:
+            note = "Suspect" if purpose == "CDR" else ""
+            draft_id, created = _add_number_draft(
+                purpose, kind, value, note, user_id
+            )
+            if created:
+                saved_ids.append(draft_id)
+            else:
+                existing_ids.append(draft_id)
+    except Exception as exc:
+        logging.exception("Quick draft save failed")
+        await update.message.reply_text(f"Could not save draft: {exc}")
+        return True
+
+    label = "CDR draft — Suspect" if purpose == "CDR" else "Bank request draft"
+    lines = [f"💾 Saved {len(saved_ids)} number(s) as {label}."]
+    if saved_ids:
+        lines.append("Draft ID(s): " + ", ".join(saved_ids))
+    if existing_ids:
+        lines.append(
+            f"{len(existing_ids)} number(s) were already open drafts: "
+            + ", ".join(existing_ids)
+        )
+    lines.append("")
+    lines.append(
+        "Send more numbers to save more drafts, or enter G7 / G5 / G3 to continue a full request."
+    )
+    await update.message.reply_text("\n".join(lines))
+    return True
+
+
 async def cdr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["flow"] = "cdr"
-    await update.message.reply_text("Enter Police Station code (example: G7):", reply_markup=ReplyKeyboardRemove())
+
+    if context.args:
+        raw_text = " ".join(context.args)
+        if await _save_quick_drafts(update, "CDR", raw_text):
+            return STATION_STEP
+
+    await update.message.reply_text(
+        "Send mobile number(s) / IMEI(s) to save as CDR draft — Suspect,\n"
+        "or enter Police Station code (example: G7) to create a full CDR request.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return STATION_STEP
 
 async def bank_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["flow"] = "bank"
-    await update.message.reply_text("Enter Police Station code (example: G7):", reply_markup=ReplyKeyboardRemove())
+
+    if context.args:
+        raw_text = " ".join(context.args)
+        if await _save_quick_drafts(update, "BANK", raw_text):
+            return STATION_STEP
+
+    await update.message.reply_text(
+        "Send bank account/mobile number(s) to save as Bank request drafts,\n"
+        "or enter Police Station code (example: G7) to create a full Bank request.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return STATION_STEP
 
 async def flow_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -383,6 +470,14 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    flow = context.user_data.get("flow")
+    if flow == "cdr":
+        if await _save_quick_drafts(update, "CDR", text):
+            return STATION_STEP
+    elif flow == "bank":
+        if await _save_quick_drafts(update, "BANK", text):
+            return STATION_STEP
 
     code = re.sub(r"[^A-Z0-9]", "", text.upper())
     aliases = {
