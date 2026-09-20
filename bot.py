@@ -2988,10 +2988,10 @@ def start_mycases_api():
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 CDR / BANK REQUEST BOT — HELP\n\n"
-        "📄 CREATE REQUESTS\n"
-        "/start — Choose CDR or BANK\n"
-        "/cdr — Start a CDR request\n"
-        "/bank — Start a Bank request\n"
+        "📄 CREATE REQUESTS / QUICK DRAFTS\n"
+        "/start — Choose CDR or BANK; bare numbers save as CDR Suspect drafts\n"
+        "/cdr — Send numbers next to save CDR Suspect drafts, or station code for full request\n"
+        "/bank — Send numbers next to save Bank drafts, or station code for full request\n"
         "/add — Add number/account to the last request\n"
         "/change — Change a number/account in the last request\n"
         "/remove — Remove a number/account from the last request\n"
