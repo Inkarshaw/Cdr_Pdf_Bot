@@ -1257,9 +1257,9 @@ async def draft_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = list(context.args)
     if not args:
         await update.message.reply_text(
-            "Save numbers for later:\\n"
-            "/draftadd cdr 9876543210 Suspect\\n"
-            "/draftadd bank account 123456789012 HDFC account\\n"
+            "Save numbers for later:\n"
+            "/draftadd cdr 9876543210 Suspect\n"
+            "/draftadd bank account 123456789012 HDFC account\n"
             "/draftadd bank mobile 9876543210 Linked number"
         )
         return
@@ -1284,7 +1284,7 @@ async def draft_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif mode == "bank":
         if len(args) < 2:
             await update.message.reply_text(
-                "Use /draftadd bank account <number> [note]\\n"
+                "Use /draftadd bank account <number> [note]\n"
                 "or /draftadd bank mobile <10-digit number> [note]"
             )
             return
@@ -1292,12 +1292,12 @@ async def draft_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         value = args.pop(0)
         purpose = "BANK"
         if bank_kind in ("mobile", "phone"):
-            if not re.fullmatch(r"\\d{10}", value):
+            if not re.fullmatch(r"\d{10}", value):
                 await update.message.reply_text("Bank mobile drafts must be exactly 10 digits.")
                 return
             identifier_type = "Mobile"
         elif bank_kind in ("account", "acc", "a/c"):
-            if not re.fullmatch(r"\\d{6,30}", value):
+            if not re.fullmatch(r"\d{6,30}", value):
                 await update.message.reply_text("Bank account drafts must be 6 to 30 digits.")
                 return
             identifier_type = "Account"
@@ -1316,10 +1316,10 @@ async def draft_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if created:
             await update.message.reply_text(
-                f"💾 Saved as draft: {draft_id}\\n"
+                f"💾 Saved as draft: {draft_id}\n"
                 f"{purpose} · {identifier_type}: {value}"
-                + (f"\\nNote: {note}" if note else "")
-                + "\\n\\nUse /drafts to view saved drafts."
+                + (f"\nNote: {note}" if note else "")
+                + "\n\nUse /drafts to view saved drafts."
             )
         else:
             await update.message.reply_text(
@@ -1339,14 +1339,14 @@ async def drafts_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for row in rows[:30]:
             note = row.get("Note / Relation", "")
             lines.append(
-                f"{row.get('Draft ID')} · {row.get('Purpose')} {row.get('Identifier Type')}\\n"
+                f"{row.get('Draft ID')} · {row.get('Purpose')} {row.get('Identifier Type')}\n"
                 f"{row.get('Identifier')}"
                 + (f" — {note}" if note else "")
             )
         if len(rows) > 30:
-            lines.append(f"\\nShowing 30 of {len(rows)} drafts.")
-        lines.append("\\nWhile entering request numbers, type DRAFTS to use matching drafts.")
-        await update.message.reply_text("\\n\\n".join(lines))
+            lines.append(f"\nShowing 30 of {len(rows)} drafts.")
+        lines.append("\nWhile entering request numbers, type DRAFTS to use matching drafts.")
+        await update.message.reply_text("\n\n".join(lines))
     except Exception as exc:
         logging.exception("Draft list failed")
         await update.message.reply_text(f"Could not read drafts: {exc}")
