@@ -15,8 +15,8 @@ from flask_cors import CORS
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, ConversationHandler, filters
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, ConversationHandler, CallbackQueryHandler, filters
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
@@ -471,10 +471,19 @@ async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pdf = build_pdf(context.user_data)
     name = f"CDR_Request_{context.user_data['crime'].replace('/', '_')}.pdf"
+    tracking_id = _safe_track_cdr(
+        context.user_data,
+        telegram_user_id=getattr(update.effective_user, "id", ""),
+        request_id=context.user_data.get("tracking_id"),
+    )
+    if tracking_id:
+        context.user_data["tracking_id"] = tracking_id
+    tracking_line = f"\nTracking ID: {tracking_id}" if tracking_id else "\nTracking: unavailable"
     await update.message.reply_document(
         document=pdf,
         filename=name,
-        caption=f"PDF generated with {len(items)} number(s). To add more later, send /add."
+        caption=f"PDF generated with {len(items)} number(s).{tracking_line}\nTo add more later, send /add.",
+        reply_markup=_cdr_tracking_keyboard(tracking_id),
     )
 
     saved = {
@@ -487,6 +496,7 @@ async def relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "to_date": context.user_data["to_date"],
         "items": list(items),
         "request_kind": "cdr",
+        "tracking_id": tracking_id,
     }
     context.user_data.clear()
     context.user_data["last_request"] = saved
@@ -654,10 +664,22 @@ async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.setdefault("to_address", TO_ADDRESS)
         pdf = build_pdf(context.user_data)
         name = f"CDR_Request_{context.user_data['crime'].replace('/', '_')}.pdf"
+        tracking_id = _safe_track_cdr(
+            context.user_data,
+            telegram_user_id=getattr(update.effective_user, "id", ""),
+            request_id=context.user_data.get("tracking_id"),
+        )
+        if tracking_id:
+            context.user_data["tracking_id"] = tracking_id
         await update.message.reply_document(
             document=pdf,
             filename=name,
-            caption="PDF generated. To add another number to this same request, send /add."
+            caption=(
+                "PDF generated. "
+                + (f"Tracking ID: {tracking_id}. " if tracking_id else "")
+                + "To add another number to this same request, send /add."
+            ),
+            reply_markup=_cdr_tracking_keyboard(tracking_id),
         )
         saved = {
             "station": context.user_data.get("station", STATION),
@@ -667,6 +689,7 @@ async def add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "section": context.user_data["section"],
             "items": list(context.user_data.get("items", [])),
             "request_kind": "cdr",
+            "tracking_id": tracking_id,
         }
         context.user_data.clear()
         context.user_data["last_request"] = saved
@@ -786,11 +809,23 @@ async def change_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pdf_data["to_date"] = saved.get("to_date", saved["items"][0]["to_date"])
         pdf = build_pdf(pdf_data)
         name = f"CDR_Request_{saved['crime'].replace('/', '_')}.pdf"
+        tracking_id = _safe_track_cdr(
+            saved,
+            telegram_user_id=getattr(update.effective_user, "id", ""),
+            request_id=saved.get("tracking_id"),
+        )
+        if tracking_id:
+            saved["tracking_id"] = tracking_id
+            context.user_data["last_request"] = saved
 
     await update.message.reply_document(
         document=pdf,
         filename=name,
-        caption=f"Changed {old_number} to {value}. Updated PDF generated."
+        caption=(
+            f"Changed {old_number} to {value}. Updated PDF generated."
+            + (f"\nTracking ID: {saved.get('tracking_id')}" if request_kind == "cdr" and saved.get("tracking_id") else "")
+        ),
+        reply_markup=_cdr_tracking_keyboard(saved.get("tracking_id")) if request_kind == "cdr" else None,
     )
     return ConversationHandler.END
 
@@ -842,10 +877,22 @@ async def remove_number_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pdf_data["to_date"] = saved.get("to_date", saved["items"][0]["to_date"])
         pdf = build_pdf(pdf_data)
         name = f"CDR_Request_{saved['crime'].replace('/', '_')}.pdf"
+        tracking_id = _safe_track_cdr(
+            saved,
+            telegram_user_id=getattr(update.effective_user, "id", ""),
+            request_id=saved.get("tracking_id"),
+        )
+        if tracking_id:
+            saved["tracking_id"] = tracking_id
+            context.user_data["last_request"] = saved
     await update.message.reply_document(
         document=pdf,
         filename=name,
-        caption=f"Removed {removed['number']}. Updated PDF generated with {len(saved['items'])} number(s)."
+        caption=(
+            f"Removed {removed['number']}. Updated PDF generated with {len(saved['items'])} number(s)."
+            + (f"\nTracking ID: {saved.get('tracking_id')}" if request_kind == "cdr" and saved.get("tracking_id") else "")
+        ),
+        reply_markup=_cdr_tracking_keyboard(saved.get("tracking_id")) if request_kind == "cdr" else None,
     )
     return ConversationHandler.END
 
@@ -938,6 +985,346 @@ def _sheet_service():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+# ---------------------------------------------------------------------------
+# CDR request tracking (Google Sheets)
+# ---------------------------------------------------------------------------
+CDR_SHEET_NAME = "CDR Requests"
+CDR_HEADERS = [
+    "Request ID", "Generated At", "Police Station", "Crime No.", "Sections",
+    "Mobile / IMEI", "Relation", "From Date", "To Date", "Status",
+    "Sent Date", "Received Date", "Last Updated", "Telegram User ID",
+    "PDF Filename", "Remarks"
+]
+
+def _ist_now():
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
+def _cdr_sheet_range(a1):
+    return f"'{CDR_SHEET_NAME}'!{a1}"
+
+def _ensure_cdr_sheet():
+    if not MYCASES_SHEET_ID:
+        raise RuntimeError("GOOGLE_SHEET_ID is not configured")
+    service = _sheet_service()
+    meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+    sheets = meta.get("sheets", [])
+    target = next(
+        (s for s in sheets if s.get("properties", {}).get("title") == CDR_SHEET_NAME),
+        None
+    )
+    if not target:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": CDR_SHEET_NAME}}}]}
+        ).execute()
+    header = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_cdr_sheet_range("A1:P1")
+    ).execute().get("values", [])
+    if not header or header[0] != CDR_HEADERS:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_cdr_sheet_range("A1:P1"),
+            valueInputOption="RAW",
+            body={"values": [CDR_HEADERS]}
+        ).execute()
+    return service
+
+def _read_cdr_rows():
+    service = _ensure_cdr_sheet()
+    rows = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_cdr_sheet_range("A2:P")
+    ).execute().get("values", [])
+    result = []
+    for index, row in enumerate(rows, start=2):
+        padded = list(row) + [""] * (len(CDR_HEADERS) - len(row))
+        result.append((index, dict(zip(CDR_HEADERS, padded[:len(CDR_HEADERS)]))))
+    return result
+
+def _next_cdr_request_id(rows=None):
+    rows = rows if rows is not None else _read_cdr_rows()
+    year = _ist_now().year
+    prefix = f"CDR-{year}-"
+    highest = 0
+    for _, row in rows:
+        rid = str(row.get("Request ID", ""))
+        if rid.startswith(prefix):
+            try:
+                highest = max(highest, int(rid[len(prefix):]))
+            except ValueError:
+                pass
+    return f"{prefix}{highest + 1:04d}"
+
+def _cdr_tracking_keyboard(request_id):
+    if not request_id:
+        return None
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 Mark Sent", callback_data=f"cdr|sent|{request_id}"),
+            InlineKeyboardButton("🟠 Partial", callback_data=f"cdr|partial|{request_id}"),
+        ],
+        [
+            InlineKeyboardButton("✅ Mark Received", callback_data=f"cdr|received|{request_id}")
+        ]
+    ])
+
+def _upsert_cdr_request(data, telegram_user_id="", request_id=None):
+    service = _ensure_cdr_sheet()
+    rows = _read_cdr_rows()
+    row_number = None
+    existing = {}
+    if request_id:
+        for rn, row in rows:
+            if row.get("Request ID") == request_id:
+                row_number = rn
+                existing = row
+                break
+    if not request_id:
+        request_id = _next_cdr_request_id(rows)
+
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    items = list(data.get("items", []))
+    numbers = "\n".join(str(item.get("number", "")) for item in items if item.get("number"))
+    relations = "\n".join(str(item.get("relation", "-") or "-") for item in items)
+    from_dates = []
+    to_dates = []
+    for item in items:
+        fd = str(item.get("from_date", data.get("from_date", "")) or "")
+        td = str(item.get("to_date", data.get("to_date", "")) or "")
+        if fd and fd not in from_dates:
+            from_dates.append(fd)
+        if td and td not in to_dates:
+            to_dates.append(td)
+    if not from_dates and data.get("from_date"):
+        from_dates.append(str(data.get("from_date")))
+    if not to_dates and data.get("to_date"):
+        to_dates.append(str(data.get("to_date")))
+
+    crime = str(data.get("crime", ""))
+    filename = f"CDR_Request_{crime.replace('/', '_')}.pdf" if crime else "CDR_Request.pdf"
+    row = [
+        request_id,
+        existing.get("Generated At") or now,
+        str(data.get("station", STATION)),
+        crime,
+        str(data.get("section", "")),
+        numbers,
+        relations,
+        "\n".join(from_dates),
+        "\n".join(to_dates),
+        existing.get("Status") or "Pending",
+        existing.get("Sent Date") or "",
+        existing.get("Received Date") or "",
+        now,
+        str(telegram_user_id or existing.get("Telegram User ID", "")),
+        filename,
+        existing.get("Remarks") or "",
+    ]
+
+    if row_number:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_cdr_sheet_range(f"A{row_number}:P{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": [row]}
+        ).execute()
+    else:
+        service.spreadsheets().values().append(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_cdr_sheet_range("A:P"),
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]}
+        ).execute()
+    return request_id
+
+def _safe_track_cdr(data, telegram_user_id="", request_id=None):
+    try:
+        return _upsert_cdr_request(data, telegram_user_id, request_id=request_id)
+    except Exception:
+        logging.exception("CDR request tracking failed")
+        return request_id
+
+def _set_cdr_status(request_id, status):
+    service = _ensure_cdr_sheet()
+    rows = _read_cdr_rows()
+    now = _ist_now().strftime("%d/%m/%Y %H:%M")
+    for row_number, row in rows:
+        if row.get("Request ID") != request_id:
+            continue
+        sent_date = row.get("Sent Date", "")
+        received_date = row.get("Received Date", "")
+        if status in ("Sent", "Partially Received") and not sent_date:
+            sent_date = now
+        if status == "Received":
+            if not sent_date:
+                sent_date = now
+            received_date = now
+        values = [[status, sent_date, received_date, now]]
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_cdr_sheet_range(f"J{row_number}:M{row_number}"),
+            valueInputOption="USER_ENTERED",
+            body={"values": values}
+        ).execute()
+        row["Status"] = status
+        row["Sent Date"] = sent_date
+        row["Received Date"] = received_date
+        row["Last Updated"] = now
+        return row
+    return None
+
+def _cdr_pending_days(row):
+    if row.get("Status") == "Received":
+        return 0
+    raw = row.get("Sent Date") or row.get("Generated At")
+    if not raw:
+        return 0
+    try:
+        dt = datetime.strptime(raw, "%d/%m/%Y %H:%M").replace(
+            tzinfo=timezone(timedelta(hours=5, minutes=30))
+        )
+        return max(0, (_ist_now().date() - dt.date()).days)
+    except ValueError:
+        return 0
+
+def _format_cdr_row(row):
+    numbers = row.get("Mobile / IMEI", "").replace("\n", ", ")
+    if len(numbers) > 120:
+        numbers = numbers[:117] + "..."
+    status = row.get("Status") or "Pending"
+    pending_text = ""
+    if status != "Received":
+        pending_text = f"\nPending: {_cdr_pending_days(row)} day(s)"
+    return (
+        f"{row.get('Request ID', '-')}\n"
+        f"Cr.No: {row.get('Crime No.', '-')}\n"
+        f"Station: {row.get('Police Station', '-')}\n"
+        f"Number(s): {numbers or '-'}\n"
+        f"Status: {status}{pending_text}"
+    )
+
+async def cdr_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        rows = [
+            row for _, row in _read_cdr_rows()
+            if (row.get("Status") or "Pending") != "Received"
+        ]
+        if not rows:
+            await update.message.reply_text("No pending CDR requests.")
+            return
+        rows.sort(key=lambda r: _cdr_pending_days(r), reverse=True)
+        shown = rows[:20]
+        text = "📋 Pending CDR Requests\n\n" + "\n\n".join(_format_cdr_row(r) for r in shown)
+        if len(rows) > len(shown):
+            text += f"\n\nShowing 20 of {len(rows)} pending requests."
+        await update.message.reply_text(text)
+    except Exception as exc:
+        logging.exception("Pending CDR list failed")
+        await update.message.reply_text(f"Could not read the CDR tracker: {exc}")
+
+async def cdr_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        rows = [row for _, row in _read_cdr_rows() if row.get("Status") == "Received"]
+        if not rows:
+            await update.message.reply_text("No CDR requests are marked Received yet.")
+            return
+        shown = list(reversed(rows[-20:]))
+        await update.message.reply_text(
+            "✅ Recently Received CDR Requests\n\n" +
+            "\n\n".join(_format_cdr_row(r) for r in shown)
+        )
+    except Exception as exc:
+        logging.exception("Received CDR list failed")
+        await update.message.reply_text(f"Could not read the CDR tracker: {exc}")
+
+async def cdr_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    term = " ".join(context.args).strip().lower()
+    if not term:
+        await update.message.reply_text(
+            "Use /search followed by a Request ID, Crime No., mobile number, or IMEI.\n"
+            "Example: /search 43/2026"
+        )
+        return
+    try:
+        matches = []
+        for _, row in _read_cdr_rows():
+            haystack = " ".join([
+                row.get("Request ID", ""),
+                row.get("Crime No.", ""),
+                row.get("Mobile / IMEI", ""),
+                row.get("Police Station", ""),
+            ]).lower()
+            if term in haystack:
+                matches.append(row)
+        if not matches:
+            await update.message.reply_text("No matching CDR request found.")
+            return
+        shown = matches[-15:]
+        await update.message.reply_text(
+            f"🔎 CDR Search Results ({len(matches)})\n\n" +
+            "\n\n".join(_format_cdr_row(r) for r in reversed(shown))
+        )
+    except Exception as exc:
+        logging.exception("CDR search failed")
+        await update.message.reply_text(f"Could not search the CDR tracker: {exc}")
+
+async def cdr_mark_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Use /markreceived CDR-2026-0001")
+        return
+    request_id = context.args[0].strip().upper()
+    try:
+        row = _set_cdr_status(request_id, "Received")
+        if not row:
+            await update.message.reply_text("Request ID not found.")
+            return
+        await update.message.reply_text(f"✅ {request_id} marked Received.")
+    except Exception as exc:
+        logging.exception("Mark received failed")
+        await update.message.reply_text(f"Could not update the CDR tracker: {exc}")
+
+async def cdr_mark_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Use /marksent CDR-2026-0001")
+        return
+    request_id = context.args[0].strip().upper()
+    try:
+        row = _set_cdr_status(request_id, "Sent")
+        if not row:
+            await update.message.reply_text("Request ID not found.")
+            return
+        await update.message.reply_text(f"📤 {request_id} marked Sent.")
+    except Exception as exc:
+        logging.exception("Mark sent failed")
+        await update.message.reply_text(f"Could not update the CDR tracker: {exc}")
+
+async def cdr_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, action, request_id = query.data.split("|", 2)
+        status_map = {
+            "sent": "Sent",
+            "partial": "Partially Received",
+            "received": "Received",
+        }
+        status = status_map.get(action)
+        if not status:
+            return
+        row = _set_cdr_status(request_id, status)
+        if not row:
+            await query.message.reply_text("CDR tracking record not found.")
+            return
+        icon = {"Sent": "📤", "Partially Received": "🟠", "Received": "✅"}[status]
+        await query.message.reply_text(f"{icon} {request_id} marked {status}.")
+    except Exception as exc:
+        logging.exception("CDR status callback failed")
+        await query.message.reply_text(f"Could not update the CDR tracker: {exc}")
+
 
 def _row_to_case(row):
     padded = list(row) + [""] * (len(MYCASES_FIELDS) - len(row))
@@ -1188,6 +1575,12 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("pending", cdr_pending))
+    app.add_handler(CommandHandler("received", cdr_received))
+    app.add_handler(CommandHandler("search", cdr_search))
+    app.add_handler(CommandHandler("markreceived", cdr_mark_received))
+    app.add_handler(CommandHandler("marksent", cdr_mark_sent))
+    app.add_handler(CallbackQueryHandler(cdr_status_callback, pattern=r"^cdr\|"))
     app.add_handler(CommandHandler("cancel", cancel))
     app.run_polling(drop_pending_updates=True)
 
