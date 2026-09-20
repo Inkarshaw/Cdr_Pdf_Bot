@@ -861,6 +861,7 @@ MYCASES_TOKEN_HOURS = 12
 
 MYCASES_FIELDS = [
     "id", "policeStation", "caseType", "crimeNo", "crimeYear",
+    "dateOccurrence", "dateRegistration", "sceneOfCrime",
     "sections", "complainant", "accused", "ioName", "priority",
     "court", "courtCaseNo", "stage", "nextHearing", "nextAction",
     "notes", "createdAt", "updatedAt", "accusedPersons", "investigationChecklist",
@@ -991,13 +992,13 @@ def _ensure_sheet():
             spreadsheetId=MYCASES_SHEET_ID,
             body={"requests":[{"addSheet":{"properties":{"title":MYCASES_SHEET_NAME}}}]}
         ).execute()
-    header_range = f"{MYCASES_SHEET_NAME}!A1:X1"
+    header_range = f"{MYCASES_SHEET_NAME}!A1:AA1"
     header = service.spreadsheets().values().get(
         spreadsheetId=MYCASES_SHEET_ID, range=header_range
     ).execute().get("values", [])
     expected = [
         "Case ID","Police Station / Unit","Case Type","Crime / CSR / UDR No.","Year",
-        "Sections / Offences","Complainant","Accused / Suspect","Investigating Officer",
+        "Date of Occurrence","Date of Registration","Scene of Crime","Sections / Offences","Complainant","Accused / Suspect","Investigating Officer",
         "Priority","Court","Court Case No.","Stage","Next Hearing / Action Date","Next Action",
         "Notes","Created At","Updated At","Accused JSON","Investigation JSON","Tasks JSON",
         "Court Hearings JSON","Timeline JSON","Attachments JSON"
@@ -1013,7 +1014,7 @@ def _read_cases():
     service = _ensure_sheet()
     result = service.spreadsheets().values().get(
         spreadsheetId=MYCASES_SHEET_ID,
-        range=f"{MYCASES_SHEET_NAME}!A2:X"
+        range=f"{MYCASES_SHEET_NAME}!A2:AA"
     ).execute()
     rows = result.get("values", [])
     return [_row_to_case(row) for row in rows if any(str(v).strip() for v in row)]
@@ -1069,7 +1070,7 @@ def mycases_create():
         service = _ensure_sheet()
         service.spreadsheets().values().append(
             spreadsheetId=MYCASES_SHEET_ID,
-            range=f"{MYCASES_SHEET_NAME}!A:X",
+            range=f"{MYCASES_SHEET_NAME}!A:AA",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [_case_to_row(item)]}
@@ -1094,7 +1095,7 @@ def mycases_update(case_id):
         service = _sheet_service()
         service.spreadsheets().values().update(
             spreadsheetId=MYCASES_SHEET_ID,
-            range=f"{MYCASES_SHEET_NAME}!A{row_number}:X{row_number}",
+            range=f"{MYCASES_SHEET_NAME}!A{row_number}:AA{row_number}",
             valueInputOption="USER_ENTERED",
             body={"values": [_case_to_row(item)]}
         ).execute()
