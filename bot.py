@@ -2980,6 +2980,321 @@ def mycases_delete(case_id):
         logging.exception("My Cases delete failed")
         return jsonify({"error": str(exc)}), 500
 
+
+# ---------------------------------------------------------------------------
+# Duty Roster cloud archive (same authenticated Google Sheet)
+# ---------------------------------------------------------------------------
+DUTY_ROSTER_SHEET_NAME = "Duty Rosters"
+DUTY_ROSTER_HEADERS = [
+    "Date", "Duty SI", "CL Count", "CL Personnel",
+    "Weekly Off Count", "Weekly Off Personnel", "Last Saved", "Roster Data"
+]
+
+def _duty_roster_sheet_range(a1):
+    return f"'{DUTY_ROSTER_SHEET_NAME}'!{a1}"
+
+def _ensure_duty_roster_sheet():
+    if not MYCASES_SHEET_ID:
+        raise RuntimeError("GOOGLE_SHEET_ID is not configured")
+
+    service = _sheet_service()
+    meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+    target = next(
+        (s for s in meta.get("sheets", [])
+         if s.get("properties", {}).get("title") == DUTY_ROSTER_SHEET_NAME),
+        None
+    )
+
+    created = False
+    if not target:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests": [{
+                "addSheet": {"properties": {"title": DUTY_ROSTER_SHEET_NAME}}
+            }]}
+        ).execute()
+        created = True
+        meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+        target = next(
+            (s for s in meta.get("sheets", [])
+             if s.get("properties", {}).get("title") == DUTY_ROSTER_SHEET_NAME),
+            None
+        )
+
+    if not target:
+        raise RuntimeError("Duty Rosters sheet could not be created")
+
+    header = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_duty_roster_sheet_range("A1:H1")
+    ).execute().get("values", [])
+
+    if not header or header[0] != DUTY_ROSTER_HEADERS:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID,
+            range=_duty_roster_sheet_range("A1:H1"),
+            valueInputOption="RAW",
+            body={"values": [DUTY_ROSTER_HEADERS]}
+        ).execute()
+
+    if created:
+        sheet_id = target["properties"]["sheetId"]
+        requests = [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": 1}
+                    },
+                    "fields": "gridProperties.frozenRowCount"
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 8
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {
+                                "red": 0.92, "green": 0.92, "blue": 0.92
+                            },
+                            "textFormat": {"bold": True},
+                            "horizontalAlignment": "CENTER"
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+                }
+            },
+            {
+                "setBasicFilter": {
+                    "filter": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 8
+                        }
+                    }
+                }
+            }
+        ]
+
+        widths = [110, 190, 80, 280, 115, 280, 170]
+        for index, width in enumerate(widths):
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": index,
+                        "endIndex": index + 1
+                    },
+                    "properties": {"pixelSize": width},
+                    "fields": "pixelSize"
+                }
+            })
+
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 7,
+                    "endIndex": 8
+                },
+                "properties": {"hiddenByUser": True},
+                "fields": "hiddenByUser"
+            }
+        })
+
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests": requests}
+        ).execute()
+
+    return service
+
+def _duty_roster_now():
+    return datetime.now(
+        timezone(timedelta(hours=5, minutes=30))
+    ).isoformat(timespec="seconds")
+
+def _read_duty_rosters():
+    service = _ensure_duty_roster_sheet()
+    rows = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=_duty_roster_sheet_range("A2:H")
+    ).execute().get("values", [])
+
+    result = []
+    for row_number, row in enumerate(rows, start=2):
+        padded = list(row) + [""] * (len(DUTY_ROSTER_HEADERS) - len(row))
+        if not str(padded[0] or "").strip():
+            continue
+
+        try:
+            roster_data = json.loads(padded[7]) if padded[7] else {}
+        except Exception:
+            roster_data = {}
+
+        def _as_int(value):
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+        result.append({
+            "rowNumber": row_number,
+            "date": str(padded[0] or ""),
+            "dutySI": str(padded[1] or ""),
+            "clCount": _as_int(padded[2]),
+            "clPersonnel": [
+                x.strip() for x in str(padded[3] or "").split(";") if x.strip()
+            ],
+            "weeklyOffCount": _as_int(padded[4]),
+            "weeklyOffPersonnel": [
+                x.strip() for x in str(padded[5] or "").split(";") if x.strip()
+            ],
+            "lastSaved": str(padded[6] or ""),
+            "rosterData": roster_data
+        })
+
+    return result
+
+def _clean_duty_roster(roster_date, data):
+    roster_date = str(roster_date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", roster_date):
+        raise ValueError("Roster date must be YYYY-MM-DD")
+
+    duty_si = str(data.get("dutySI", "") or "").strip()
+    cl_people = data.get("clPersonnel", [])
+    wo_people = data.get("weeklyOffPersonnel", [])
+    roster_data = data.get("rosterData", {})
+
+    if not isinstance(cl_people, list):
+        cl_people = []
+    if not isinstance(wo_people, list):
+        wo_people = []
+    if not isinstance(roster_data, dict):
+        roster_data = {}
+
+    cl_people = [str(x or "").strip() for x in cl_people if str(x or "").strip()]
+    wo_people = [str(x or "").strip() for x in wo_people if str(x or "").strip()]
+
+    return {
+        "date": roster_date,
+        "dutySI": duty_si,
+        "clCount": len(cl_people),
+        "clPersonnel": cl_people,
+        "weeklyOffCount": len(wo_people),
+        "weeklyOffPersonnel": wo_people,
+        "lastSaved": _duty_roster_now(),
+        "rosterData": roster_data
+    }
+
+def _duty_roster_to_row(item):
+    return [
+        item["date"],
+        item["dutySI"],
+        item["clCount"],
+        "; ".join(item["clPersonnel"]),
+        item["weeklyOffCount"],
+        "; ".join(item["weeklyOffPersonnel"]),
+        item["lastSaved"],
+        json.dumps(item["rosterData"], ensure_ascii=False, separators=(",", ":"))
+    ]
+
+@api_app.get("/api/duty-rosters")
+def duty_rosters_list():
+    denied = _require_auth()
+    if denied:
+        return denied
+
+    try:
+        items = _read_duty_rosters()
+        summaries = [{
+            "date": item["date"],
+            "dutySI": item["dutySI"],
+            "clCount": item["clCount"],
+            "clPersonnel": item["clPersonnel"],
+            "weeklyOffCount": item["weeklyOffCount"],
+            "weeklyOffPersonnel": item["weeklyOffPersonnel"],
+            "lastSaved": item["lastSaved"]
+        } for item in items]
+        summaries.sort(key=lambda x: x.get("date", ""), reverse=True)
+        return jsonify({"rosters": summaries})
+    except Exception as exc:
+        logging.exception("Duty Roster list failed")
+        return jsonify({"error": str(exc)}), 500
+
+@api_app.get("/api/duty-rosters/<roster_date>")
+def duty_roster_get(roster_date):
+    denied = _require_auth()
+    if denied:
+        return denied
+
+    try:
+        item = next(
+            (x for x in _read_duty_rosters() if x.get("date") == roster_date),
+            None
+        )
+        if not item:
+            return jsonify({"error": "Duty roster not found"}), 404
+        item.pop("rowNumber", None)
+        return jsonify({"roster": item})
+    except Exception as exc:
+        logging.exception("Duty Roster get failed")
+        return jsonify({"error": str(exc)}), 500
+
+@api_app.put("/api/duty-rosters/<roster_date>")
+def duty_roster_upsert(roster_date):
+    denied = _require_auth()
+    if denied:
+        return denied
+
+    try:
+        item = _clean_duty_roster(
+            roster_date,
+            request.get_json(silent=True) or {}
+        )
+        service = _ensure_duty_roster_sheet()
+        existing = next(
+            (x for x in _read_duty_rosters() if x.get("date") == roster_date),
+            None
+        )
+        values = [_duty_roster_to_row(item)]
+
+        if existing:
+            row_number = existing["rowNumber"]
+            service.spreadsheets().values().update(
+                spreadsheetId=MYCASES_SHEET_ID,
+                range=_duty_roster_sheet_range(
+                    f"A{row_number}:H{row_number}"
+                ),
+                valueInputOption="RAW",
+                body={"values": values}
+            ).execute()
+        else:
+            service.spreadsheets().values().append(
+                spreadsheetId=MYCASES_SHEET_ID,
+                range=_duty_roster_sheet_range("A:H"),
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": values}
+            ).execute()
+
+        return jsonify({"ok": True, "roster": item})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("Duty Roster save failed")
+        return jsonify({"error": str(exc)}), 500
+
 def start_mycases_api():
     port = int(os.environ.get("PORT", "8080"))
     api_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
