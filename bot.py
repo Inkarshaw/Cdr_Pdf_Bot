@@ -1172,7 +1172,7 @@ MYCASES_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 MYCASES_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Cases")
 MYCASES_PASSWORD = os.environ.get("MYCASES_PASSWORD", "")
 MYCASES_SESSION_SECRET = os.environ.get("SESSION_SECRET", "")
-MYCASES_TOKEN_HOURS = 12
+MYCASES_TOKEN_HOURS = 24 * 7
 
 MYCASES_FIELDS = [
     "id", "policeStation", "caseType", "crimeNo", "crimeYear",
