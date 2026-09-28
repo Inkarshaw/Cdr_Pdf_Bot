@@ -1172,7 +1172,7 @@ MYCASES_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 MYCASES_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Cases")
 MYCASES_PASSWORD = os.environ.get("MYCASES_PASSWORD", "")
 MYCASES_SESSION_SECRET = os.environ.get("SESSION_SECRET", "")
-MYCASES_TOKEN_HOURS = 1
+MYCASES_TOKEN_HOURS = 24 * 7
 
 MYCASES_FIELDS = [
     "id", "policeStation", "caseType", "crimeNo", "crimeYear",
@@ -1180,11 +1180,14 @@ MYCASES_FIELDS = [
     "sections", "complainant", "accused", "ioName", "priority",
     "court", "courtCaseNo", "stage", "nextHearing", "nextAction",
     "notes", "createdAt", "updatedAt", "accusedPersons", "investigationChecklist",
-    "tasks", "hearings", "timeline", "attachments"
+    "tasks", "hearings", "timeline", "attachments",
+    "courtComplex", "courtCaseType", "accusedPresentDetails",
+    "nbwStatus", "fsStatus", "finalResult"
 ]
 MYCASES_JSON_FIELDS = {
     "accusedPersons", "investigationChecklist", "tasks", "hearings", "timeline", "attachments"
 }
+MYCASES_DELETED_SHEET_NAME = os.environ.get("GOOGLE_DELETED_SHEET_NAME", "Deleted Cases")
 
 api_app = Flask("clearexams_mycases_api")
 CORS(
@@ -2689,6 +2692,34 @@ async def overdue_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Could not build overdue summary: {exc}")
 
 
+def _column_name(n):
+    out = ""
+    while n > 0:
+        n -= 1
+        out = chr(65 + (n % 26)) + out
+        n //= 26
+    return out
+
+def _sanitize_accused_for_cloud(value):
+    result = []
+    for person in value if isinstance(value, list) else []:
+        if not isinstance(person, dict):
+            continue
+        clean = dict(person)
+        clean.pop("photo", None)
+        result.append(clean)
+    return result
+
+def _sanitize_attachments_for_cloud(value):
+    result = []
+    for attachment in value if isinstance(value, list) else []:
+        if not isinstance(attachment, dict):
+            continue
+        clean = dict(attachment)
+        clean.pop("data", None)
+        result.append(clean)
+    return result
+
 def _row_to_case(row):
     padded = list(row) + [""] * (len(MYCASES_FIELDS) - len(row))
     item = {}
@@ -2707,7 +2738,11 @@ def _case_to_row(item):
     row = []
     for key in MYCASES_FIELDS:
         value = item.get(key, "")
-        if key in MYCASES_JSON_FIELDS:
+        if key == "accusedPersons":
+            row.append(json.dumps(_sanitize_accused_for_cloud(value), separators=(",", ":")))
+        elif key == "attachments":
+            row.append(json.dumps(_sanitize_attachments_for_cloud(value), separators=(",", ":")))
+        elif key in MYCASES_JSON_FIELDS:
             row.append(json.dumps(value if isinstance(value, list) else [], separators=(",", ":")))
         else:
             row.append(str(value or ""))
@@ -2721,7 +2756,11 @@ def _clean_case(data, existing=None):
         if key in ("createdAt", "updatedAt"):
             continue
         value = data.get(key, "") if isinstance(data, dict) else ""
-        if key in MYCASES_JSON_FIELDS:
+        if key == "accusedPersons":
+            item[key] = _sanitize_accused_for_cloud(value)
+        elif key == "attachments":
+            item[key] = _sanitize_attachments_for_cloud(value)
+        elif key in MYCASES_JSON_FIELDS:
             item[key] = value if isinstance(value, list) else []
         else:
             item[key] = str(value).strip() if value is not None else ""
@@ -2736,23 +2775,41 @@ def _ensure_sheet():
     service = _sheet_service()
     meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
     sheets = meta.get("sheets", [])
-    target = next((s for s in sheets if s.get("properties", {}).get("title") == MYCASES_SHEET_NAME), None)
+    target = next((x for x in sheets if x.get("properties", {}).get("title") == MYCASES_SHEET_NAME), None)
     if not target:
         service.spreadsheets().batchUpdate(
             spreadsheetId=MYCASES_SHEET_ID,
             body={"requests":[{"addSheet":{"properties":{"title":MYCASES_SHEET_NAME}}}]}
         ).execute()
-    header_range = f"{MYCASES_SHEET_NAME}!A1:AA1"
-    header = service.spreadsheets().values().get(
-        spreadsheetId=MYCASES_SHEET_ID, range=header_range
-    ).execute().get("values", [])
+        meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+        target = next((x for x in meta.get("sheets", []) if x.get("properties", {}).get("title") == MYCASES_SHEET_NAME), None)
+    if not target:
+        raise RuntimeError("Cases sheet could not be created")
+
     expected = [
         "Case ID","Police Station / Unit","Case Type","Crime / CSR / UDR No.","Year",
         "Date of Occurrence","Date of Registration","Scene of Crime","Sections / Offences","Complainant","Accused / Suspect","Investigating Officer",
         "Priority","Court","Court Case No.","Stage","Next Hearing / Action Date","Next Action",
         "Notes","Created At","Updated At","Accused JSON","Investigation JSON","Tasks JSON",
-        "Court Hearings JSON","Timeline JSON","Attachments JSON"
+        "Court Hearings JSON","Timeline JSON","Attachments JSON",
+        "Court Complex","Court Case Type","Accused Present Details","NBW Status","FS Status","Final Result"
     ]
+    last_col = _column_name(len(expected))
+    props = target.get("properties", {})
+    if int(props.get("gridProperties", {}).get("columnCount", 0) or 0) < len(expected):
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests":[{
+                "updateSheetProperties":{
+                    "properties":{"sheetId":props["sheetId"],"gridProperties":{"columnCount":len(expected)}},
+                    "fields":"gridProperties.columnCount"
+                }
+            }]}
+        ).execute()
+    header_range = f"'{MYCASES_SHEET_NAME}'!A1:{last_col}1"
+    header = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID, range=header_range
+    ).execute().get("values", [])
     if not header or header[0] != expected:
         service.spreadsheets().values().update(
             spreadsheetId=MYCASES_SHEET_ID, range=header_range,
@@ -2853,7 +2910,7 @@ def _read_cases():
     service = _ensure_sheet()
     result = service.spreadsheets().values().get(
         spreadsheetId=MYCASES_SHEET_ID,
-        range=f"{MYCASES_SHEET_NAME}!A2:AA"
+        range=f"'{MYCASES_SHEET_NAME}'!A2:{_column_name(len(MYCASES_FIELDS))}"
     ).execute()
     rows = result.get("values", [])
     cases = [_row_to_case(row) for row in rows if any(str(v).strip() for v in row)]
@@ -2865,6 +2922,95 @@ def _find_case(case_id):
         if item.get("id") == case_id:
             return cases, idx, idx + 2, item
     return cases, -1, None, None
+
+
+def _ensure_deleted_cases_sheet():
+    service = _sheet_service()
+    meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+    target = next(
+        (x for x in meta.get("sheets", []) if x.get("properties", {}).get("title") == MYCASES_DELETED_SHEET_NAME),
+        None
+    )
+    if not target:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests":[{"addSheet":{"properties":{"title":MYCASES_DELETED_SHEET_NAME}}}]}
+        ).execute()
+        meta = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+        target = next(
+            (x for x in meta.get("sheets", []) if x.get("properties", {}).get("title") == MYCASES_DELETED_SHEET_NAME),
+            None
+        )
+    if not target:
+        raise RuntimeError("Deleted Cases sheet could not be created")
+    headers = [
+        "Case ID","Police Station / Unit","Case Type","Crime / CSR / UDR No.","Year",
+        "Date of Occurrence","Date of Registration","Scene of Crime","Sections / Offences","Complainant","Accused / Suspect","Investigating Officer",
+        "Priority","Court","Court Case No.","Stage","Next Hearing / Action Date","Next Action",
+        "Notes","Created At","Updated At","Accused JSON","Investigation JSON","Tasks JSON",
+        "Court Hearings JSON","Timeline JSON","Attachments JSON",
+        "Court Complex","Court Case Type","Accused Present Details","NBW Status","FS Status","Final Result","Deleted At"
+    ]
+    props = target.get("properties", {})
+    if int(props.get("gridProperties", {}).get("columnCount", 0) or 0) < len(headers):
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=MYCASES_SHEET_ID,
+            body={"requests":[{
+                "updateSheetProperties":{
+                    "properties":{"sheetId":props["sheetId"],"gridProperties":{"columnCount":len(headers)}},
+                    "fields":"gridProperties.columnCount"
+                }
+            }]}
+        ).execute()
+    last_col = _column_name(len(headers))
+    header_range = f"'{MYCASES_DELETED_SHEET_NAME}'!A1:{last_col}1"
+    header = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID, range=header_range
+    ).execute().get("values", [])
+    if not header or header[0] != headers:
+        service.spreadsheets().values().update(
+            spreadsheetId=MYCASES_SHEET_ID, range=header_range,
+            valueInputOption="RAW", body={"values":[headers]}
+        ).execute()
+    return service
+
+def _read_deleted_cases():
+    service = _ensure_deleted_cases_sheet()
+    last_col = _column_name(len(MYCASES_FIELDS) + 1)
+    rows = service.spreadsheets().values().get(
+        spreadsheetId=MYCASES_SHEET_ID,
+        range=f"'{MYCASES_DELETED_SHEET_NAME}'!A2:{last_col}"
+    ).execute().get("values", [])
+    result = []
+    for row_number, row in enumerate(rows, start=2):
+        if not any(str(v).strip() for v in row):
+            continue
+        item = _row_to_case(row[:len(MYCASES_FIELDS)])
+        item["deletedAt"] = row[len(MYCASES_FIELDS)] if len(row) > len(MYCASES_FIELDS) else ""
+        result.append((row_number, item))
+    return result
+
+def _delete_sheet_row(service, sheet_name, row_number):
+    metadata = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
+    target = next(
+        (x for x in metadata.get("sheets", []) if x.get("properties", {}).get("title") == sheet_name),
+        None
+    )
+    if not target:
+        raise RuntimeError(f"{sheet_name} sheet not found")
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=MYCASES_SHEET_ID,
+        body={"requests":[{
+            "deleteDimension":{
+                "range":{
+                    "sheetId":target["properties"]["sheetId"],
+                    "dimension":"ROWS",
+                    "startIndex":row_number - 1,
+                    "endIndex":row_number
+                }
+            }
+        }]}
+    ).execute()
 
 @api_app.get("/health")
 def mycases_health():
@@ -2910,7 +3056,7 @@ def mycases_create():
         service = _ensure_sheet()
         service.spreadsheets().values().append(
             spreadsheetId=MYCASES_SHEET_ID,
-            range=f"{MYCASES_SHEET_NAME}!A:AA",
+            range=f"'{MYCASES_SHEET_NAME}'!A:{_column_name(len(MYCASES_FIELDS))}",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [_case_to_row(item)]}
@@ -2935,7 +3081,7 @@ def mycases_update(case_id):
         service = _sheet_service()
         service.spreadsheets().values().update(
             spreadsheetId=MYCASES_SHEET_ID,
-            range=f"{MYCASES_SHEET_NAME}!A{row_number}:AA{row_number}",
+            range=f"'{MYCASES_SHEET_NAME}'!A{row_number}:{_column_name(len(MYCASES_FIELDS))}{row_number}",
             valueInputOption="USER_ENTERED",
             body={"values": [_case_to_row(item)]}
         ).execute()
@@ -2953,31 +3099,93 @@ def mycases_delete(case_id):
         cases, idx, row_number, existing = _find_case(case_id)
         if idx < 0:
             return jsonify({"error": "Case not found"}), 404
-        service = _sheet_service()
-        metadata = service.spreadsheets().get(spreadsheetId=MYCASES_SHEET_ID).execute()
-        target = next(
-            (s for s in metadata.get("sheets", []) if s.get("properties", {}).get("title") == MYCASES_SHEET_NAME),
-            None
-        )
-        if not target:
-            return jsonify({"error": "Cases sheet not found"}), 500
-        sheet_id = target["properties"]["sheetId"]
-        service.spreadsheets().batchUpdate(
+
+        deleted_at = datetime.now(timezone.utc).isoformat()
+        deleted_service = _ensure_deleted_cases_sheet()
+        deleted_service.spreadsheets().values().append(
             spreadsheetId=MYCASES_SHEET_ID,
-            body={"requests": [{
-                "deleteDimension": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "ROWS",
-                        "startIndex": row_number - 1,
-                        "endIndex": row_number
-                    }
-                }
-            }]}
+            range=f"'{MYCASES_DELETED_SHEET_NAME}'!A:{_column_name(len(MYCASES_FIELDS) + 1)}",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values":[_case_to_row(existing) + [deleted_at]]}
         ).execute()
-        return jsonify({"ok": True})
+
+        service = _sheet_service()
+        _delete_sheet_row(service, MYCASES_SHEET_NAME, row_number)
+        return jsonify({"ok": True, "deletedAt": deleted_at})
     except Exception as exc:
         logging.exception("My Cases delete failed")
+        return jsonify({"error": str(exc)}), 500
+
+@api_app.get("/api/deleted-cases")
+def mycases_deleted_list():
+    denied = _require_auth()
+    if denied:
+        return denied
+    try:
+        return jsonify({"cases":[item for _, item in _read_deleted_cases()]})
+    except Exception as exc:
+        logging.exception("My Cases deleted list failed")
+        return jsonify({"error": str(exc)}), 500
+
+@api_app.post("/api/deleted-cases/<case_id>/restore")
+def mycases_deleted_restore(case_id):
+    denied = _require_auth()
+    if denied:
+        return denied
+    try:
+        deleted_rows = _read_deleted_cases()
+        match = next(((row_number, item) for row_number, item in deleted_rows if item.get("id") == case_id), None)
+        if not match:
+            return jsonify({"error": "Deleted case not found"}), 404
+        deleted_row, archived = match
+        archived = dict(archived)
+        archived.pop("deletedAt", None)
+        archived["updatedAt"] = datetime.now(timezone.utc).isoformat()
+
+        cases, idx, row_number, existing = _find_case(case_id)
+        service = _ensure_sheet()
+        if idx >= 0:
+            restored = _clean_case(archived, existing)
+            service.spreadsheets().values().update(
+                spreadsheetId=MYCASES_SHEET_ID,
+                range=f"'{MYCASES_SHEET_NAME}'!A{row_number}:{_column_name(len(MYCASES_FIELDS))}{row_number}",
+                valueInputOption="USER_ENTERED",
+                body={"values":[_case_to_row(restored)]}
+            ).execute()
+        else:
+            restored = _clean_case(archived)
+            service.spreadsheets().values().append(
+                spreadsheetId=MYCASES_SHEET_ID,
+                range=f"'{MYCASES_SHEET_NAME}'!A:{_column_name(len(MYCASES_FIELDS))}",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values":[_case_to_row(restored)]}
+            ).execute()
+
+        deleted_service = _sheet_service()
+        _delete_sheet_row(deleted_service, MYCASES_DELETED_SHEET_NAME, deleted_row)
+        return jsonify({"case": restored})
+    except Exception as exc:
+        logging.exception("My Cases restore failed")
+        return jsonify({"error": str(exc)}), 500
+
+@api_app.delete("/api/deleted-cases/<case_id>")
+def mycases_deleted_permanent_delete(case_id):
+    denied = _require_auth()
+    if denied:
+        return denied
+    try:
+        deleted_rows = _read_deleted_cases()
+        match = next(((row_number, item) for row_number, item in deleted_rows if item.get("id") == case_id), None)
+        if not match:
+            return jsonify({"error": "Deleted case not found"}), 404
+        row_number, _ = match
+        service = _sheet_service()
+        _delete_sheet_row(service, MYCASES_DELETED_SHEET_NAME, row_number)
+        return jsonify({"ok": True})
+    except Exception as exc:
+        logging.exception("My Cases permanent delete failed")
         return jsonify({"error": str(exc)}), 500
 
 
