@@ -1182,10 +1182,10 @@ MYCASES_FIELDS = [
     "notes", "createdAt", "updatedAt", "accusedPersons", "investigationChecklist",
     "tasks", "hearings", "timeline", "attachments",
     "courtComplex", "courtCaseType", "accusedPresentDetails",
-    "nbwStatus", "fsStatus", "finalResult"
+    "nbwStatus", "fsStatus", "finalResult", "propertyItems"
 ]
 MYCASES_JSON_FIELDS = {
-    "accusedPersons", "investigationChecklist", "tasks", "hearings", "timeline", "attachments"
+    "accusedPersons", "investigationChecklist", "tasks", "hearings", "timeline", "attachments", "propertyItems"
 }
 MYCASES_DELETED_SHEET_NAME = os.environ.get("GOOGLE_DELETED_SHEET_NAME", "Deleted Cases")
 
@@ -2720,6 +2720,16 @@ def _sanitize_attachments_for_cloud(value):
         result.append(clean)
     return result
 
+def _sanitize_property_items_for_cloud(value):
+    result = []
+    for prop in value if isinstance(value, list) else []:
+        if not isinstance(prop, dict):
+            continue
+        clean = dict(prop)
+        clean.pop("photo", None)
+        result.append(clean)
+    return result
+
 def _row_to_case(row):
     padded = list(row) + [""] * (len(MYCASES_FIELDS) - len(row))
     item = {}
@@ -2742,6 +2752,8 @@ def _case_to_row(item):
             row.append(json.dumps(_sanitize_accused_for_cloud(value), separators=(",", ":")))
         elif key == "attachments":
             row.append(json.dumps(_sanitize_attachments_for_cloud(value), separators=(",", ":")))
+        elif key == "propertyItems":
+            row.append(json.dumps(_sanitize_property_items_for_cloud(value), separators=(",", ":")))
         elif key in MYCASES_JSON_FIELDS:
             row.append(json.dumps(value if isinstance(value, list) else [], separators=(",", ":")))
         else:
@@ -2760,6 +2772,8 @@ def _clean_case(data, existing=None):
             item[key] = _sanitize_accused_for_cloud(value)
         elif key == "attachments":
             item[key] = _sanitize_attachments_for_cloud(value)
+        elif key == "propertyItems":
+            item[key] = _sanitize_property_items_for_cloud(value)
         elif key in MYCASES_JSON_FIELDS:
             item[key] = value if isinstance(value, list) else []
         else:
@@ -2792,7 +2806,8 @@ def _ensure_sheet():
         "Priority","Court","Court Case No.","Stage","Next Hearing / Action Date","Next Action",
         "Notes","Created At","Updated At","Accused JSON","Investigation JSON","Tasks JSON",
         "Court Hearings JSON","Timeline JSON","Attachments JSON",
-        "Court Complex","Court Case Type","Accused Present Details","NBW Status","FS Status","Final Result"
+        "Court Complex","Court Case Type","Accused Present Details","NBW Status","FS Status","Final Result",
+        "Property Items JSON"
     ]
     last_col = _column_name(len(expected))
     props = target.get("properties", {})
