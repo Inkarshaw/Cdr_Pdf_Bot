@@ -1182,10 +1182,10 @@ MYCASES_FIELDS = [
     "notes", "createdAt", "updatedAt", "accusedPersons", "investigationChecklist",
     "tasks", "hearings", "timeline", "attachments",
     "courtComplex", "courtCaseType", "accusedPresentDetails",
-    "nbwStatus", "fsStatus", "finalResult", "propertyItems"
+    "nbwStatus", "fsStatus", "finalResult", "propertyItems", "caseDiaryEntries"
 ]
 MYCASES_JSON_FIELDS = {
-    "accusedPersons", "investigationChecklist", "tasks", "hearings", "timeline", "attachments", "propertyItems"
+    "accusedPersons", "investigationChecklist", "tasks", "hearings", "timeline", "attachments", "propertyItems", "caseDiaryEntries"
 }
 MYCASES_DELETED_SHEET_NAME = os.environ.get("GOOGLE_DELETED_SHEET_NAME", "Deleted Cases")
 
@@ -2807,7 +2807,7 @@ def _ensure_sheet():
         "Notes","Created At","Updated At","Accused JSON","Investigation JSON","Tasks JSON",
         "Court Hearings JSON","Timeline JSON","Attachments JSON",
         "Court Complex","Court Case Type","Accused Present Details","NBW Status","FS Status","Final Result",
-        "Property Items JSON"
+        "Property Items JSON", "Case Diary JSON"
     ]
     last_col = _column_name(len(expected))
     props = target.get("properties", {})
@@ -2964,7 +2964,8 @@ def _ensure_deleted_cases_sheet():
         "Priority","Court","Court Case No.","Stage","Next Hearing / Action Date","Next Action",
         "Notes","Created At","Updated At","Accused JSON","Investigation JSON","Tasks JSON",
         "Court Hearings JSON","Timeline JSON","Attachments JSON",
-        "Court Complex","Court Case Type","Accused Present Details","NBW Status","FS Status","Final Result","Deleted At"
+        "Court Complex","Court Case Type","Accused Present Details","NBW Status","FS Status","Final Result",
+        "Property Items JSON","Case Diary JSON","Deleted At"
     ]
     props = target.get("properties", {})
     if int(props.get("gridProperties", {}).get("columnCount", 0) or 0) < len(headers):
@@ -3002,6 +3003,12 @@ def _read_deleted_cases():
             continue
         item = _row_to_case(row[:len(MYCASES_FIELDS)])
         item["deletedAt"] = row[len(MYCASES_FIELDS)] if len(row) > len(MYCASES_FIELDS) else ""
+        # Older deleted rows stored Deleted At before Case Diary JSON existed.
+        if not item["deletedAt"] and len(row) > len(MYCASES_FIELDS) - 1:
+            legacy_deleted = str(row[len(MYCASES_FIELDS) - 1]).strip()
+            if re.match(r"^20\\d{2}-\\d{2}-\\d{2}[T ]", legacy_deleted):
+                item["deletedAt"] = legacy_deleted
+                item["caseDiaryEntries"] = []
         result.append((row_number, item))
     return result
 
